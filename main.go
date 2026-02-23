@@ -44,6 +44,7 @@ func main() {
 		MemoryWindow:  cfg.Agent.MemoryWindow,
 		SessionPath:   filepath.Join(cfg.Agent.DataDir, "session.jsonl"),
 		MemoryDir:     filepath.Join(cfg.Agent.DataDir, "memory"),
+		SkillsDir:     filepath.Join(cfg.Agent.DataDir, "skills"),
 		WorkDir:       cfg.Agent.WorkDir,
 		DataDir:       cfg.Agent.DataDir,
 	})

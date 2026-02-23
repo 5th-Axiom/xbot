@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -110,6 +113,15 @@ func (f *FeishuChannel) Send(msg bus.OutboundMessage) error {
 		return nil
 	}
 
+	// 1) 提取 markdown 中的本地文件链接 [name](path)，上传并单独发送，从内容中移除
+	content := f.extractAndSendLocalFiles(msg.ChatID, msg.Content)
+	// 2) 替换 markdown 中的本地图片引用 ![alt](path) 为飞书 image_key
+	content = f.replaceLocalImages(content)
+
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+
 	// 判断 receive_id_type
 	receiveIDType := "chat_id"
 	if !strings.HasPrefix(msg.ChatID, "oc_") {
@@ -117,7 +129,7 @@ func (f *FeishuChannel) Send(msg bus.OutboundMessage) error {
 	}
 
 	// 构建消息卡片
-	card := f.buildCard(msg.Content)
+	card := f.buildCard(content)
 	cardJSON, err := json.Marshal(card)
 	if err != nil {
 		return fmt.Errorf("marshal card: %w", err)
@@ -142,6 +154,173 @@ func (f *FeishuChannel) Send(msg bus.OutboundMessage) error {
 
 	log.WithField("chat_id", msg.ChatID).Debug("Feishu message sent")
 	return nil
+}
+
+// imageExtensions 图片文件扩展名集合
+var imageExtensions = map[string]bool{
+	".jpg": true, ".jpeg": true, ".png": true, ".webp": true,
+	".gif": true, ".bmp": true, ".ico": true, ".tiff": true, ".heic": true,
+}
+
+// mdLinkRe 匹配 markdown 链接语法 [name](path)，但不匹配图片 ![alt](path)
+var mdLinkRe = regexp.MustCompile(`(?:^|[^!])\[([^\]]+)\]\(([^)]+)\)`)
+
+// extractAndSendLocalFiles 从 markdown 中提取本地文件链接（非图片），上传并发送文件消息，从内容中移除该链接
+func (f *FeishuChannel) extractAndSendLocalFiles(chatID, content string) string {
+	return mdLinkRe.ReplaceAllStringFunc(content, func(match string) string {
+		subs := mdLinkRe.FindStringSubmatch(match)
+		if len(subs) < 3 {
+			return match
+		}
+		linkPath := subs[2]
+
+		// 保留前缀字符（mdLinkRe 可能捕获了 [ 前的非 ! 字符）
+		prefix := ""
+		if len(match) > 0 && match[0] != '[' {
+			prefix = string(match[0])
+		}
+
+		// 跳过 URL
+		if strings.HasPrefix(linkPath, "http://") || strings.HasPrefix(linkPath, "https://") {
+			return match
+		}
+
+		// 跳过图片扩展名（图片由 replaceLocalImages 处理）
+		ext := strings.ToLower(filepath.Ext(linkPath))
+		if imageExtensions[ext] {
+			return match
+		}
+
+		// 检查文件是否存在
+		if _, err := os.Stat(linkPath); err != nil {
+			return match
+		}
+
+		// 上传并发送文件
+		if err := f.sendFile(chatID, linkPath); err != nil {
+			log.WithError(err).WithField("path", linkPath).Warn("Failed to send local file")
+			return match
+		}
+
+		log.WithField("path", linkPath).Debug("Sent local file from markdown link")
+
+		// 替换链接为纯文本提示
+		return prefix + "📎 " + subs[1]
+	})
+}
+
+// sendFile 上传并发送文件消息
+func (f *FeishuChannel) sendFile(chatID, filePath string) error {
+	fileKey, err := f.uploadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("upload file: %w", err)
+	}
+
+	receiveIDType := "chat_id"
+	if !strings.HasPrefix(chatID, "oc_") {
+		receiveIDType = "open_id"
+	}
+
+	fileName := filepath.Base(filePath)
+	content, _ := json.Marshal(map[string]string{"file_key": fileKey, "file_name": fileName})
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType(receiveIDType).
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(chatID).
+			MsgType("file").
+			Content(string(content)).
+			Build()).
+		Build()
+
+	resp, err := f.client.Im.Message.Create(context.Background(), req)
+	if err != nil {
+		return fmt.Errorf("send file message: %w", err)
+	}
+	if !resp.Success() {
+		return fmt.Errorf("feishu API error: code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+
+	log.WithFields(log.Fields{
+		"chat_id":  chatID,
+		"file_key": fileKey,
+	}).Debug("Feishu file sent")
+	return nil
+}
+
+// uploadImage 上传图片到飞书，返回 image_key
+func (f *FeishuChannel) uploadImage(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("open file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	imageType := "message"
+	req := larkim.NewCreateImageReqBuilder().
+		Body(&larkim.CreateImageReqBody{
+			ImageType: &imageType,
+			Image:     file,
+		}).
+		Build()
+
+	resp, err := f.client.Im.Image.Create(context.Background(), req)
+	if err != nil {
+		return "", fmt.Errorf("upload image API: %w", err)
+	}
+	if !resp.Success() {
+		return "", fmt.Errorf("upload image error: code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+	return *resp.Data.ImageKey, nil
+}
+
+// uploadFile 上传文件到飞书，返回 file_key
+func (f *FeishuChannel) uploadFile(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("open file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	fileName := filepath.Base(filePath)
+	fileType := f.detectFileType(filePath)
+
+	req := larkim.NewCreateFileReqBuilder().
+		Body(&larkim.CreateFileReqBody{
+			FileType: &fileType,
+			FileName: &fileName,
+			File:     file,
+		}).
+		Build()
+
+	resp, err := f.client.Im.File.Create(context.Background(), req)
+	if err != nil {
+		return "", fmt.Errorf("upload file API: %w", err)
+	}
+	if !resp.Success() {
+		return "", fmt.Errorf("upload file error: code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+	return *resp.Data.FileKey, nil
+}
+
+// detectFileType 根据扩展名检测飞书文件类型
+func (f *FeishuChannel) detectFileType(filePath string) string {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	switch ext {
+	case ".mp4":
+		return "mp4"
+	case ".pdf":
+		return "pdf"
+	case ".doc", ".docx":
+		return "doc"
+	case ".xls", ".xlsx":
+		return "xls"
+	case ".ppt", ".pptx":
+		return "ppt"
+	case ".opus":
+		return "opus"
+	default:
+		return "stream"
+	}
 }
 
 // onMessage 处理收到的消息
@@ -290,6 +469,52 @@ func (f *FeishuChannel) extractFromLang(langContent map[string]any) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// mdImageRe 匹配 markdown 图片语法 ![alt](path)
+var mdImageRe = regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
+
+// replaceLocalImages 扫描 markdown 中的本地图片引用，上传后替换为飞书 image_key
+func (f *FeishuChannel) replaceLocalImages(content string) string {
+	return mdImageRe.ReplaceAllStringFunc(content, func(match string) string {
+		subs := mdImageRe.FindStringSubmatch(match)
+		if len(subs) < 3 {
+			return match
+		}
+		imgPath := subs[2]
+
+		// 跳过 URL（http/https）和已经是 image_key 的（img_ 前缀）
+		if strings.HasPrefix(imgPath, "http://") || strings.HasPrefix(imgPath, "https://") || strings.HasPrefix(imgPath, "img_") {
+			return match
+		}
+
+		// 检查文件是否是图片类型
+		ext := strings.ToLower(filepath.Ext(imgPath))
+		if !imageExtensions[ext] {
+			return match
+		}
+
+		// 检查文件是否存在
+		if _, err := os.Stat(imgPath); err != nil {
+			log.WithField("path", imgPath).Debug("Local image not found, keeping original markdown")
+			return match
+		}
+
+		// 上传图片
+		imageKey, err := f.uploadImage(imgPath)
+		if err != nil {
+			log.WithError(err).WithField("path", imgPath).Warn("Failed to upload local image, keeping original markdown")
+			return match
+		}
+
+		log.WithFields(log.Fields{
+			"path":      imgPath,
+			"image_key": imageKey,
+		}).Debug("Replaced local image with image_key")
+
+		// 替换为飞书 image_key 格式
+		return fmt.Sprintf("![%s](%s)", subs[1], imageKey)
+	})
 }
 
 // buildCard 构建飞书消息卡片（JSON 2.0 结构）

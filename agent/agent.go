@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,8 @@ type Agent struct {
 	maxIterations int
 	memoryWindow  int
 	memory        *MemoryStore
+	skills        *tools.SkillStore
+	mcpManager    *tools.MCPManager
 	workDir       string
 	dataDir       string
 
@@ -41,6 +44,7 @@ type Config struct {
 	MemoryWindow  int    // 上下文窗口大小（保留的历史消息数）
 	SessionPath   string // 会话持久化文件路径（空则不持久化）
 	MemoryDir     string // 记忆文件目录（MEMORY.md / HISTORY.md）
+	SkillsDir     string // Skills 目录
 	WorkDir       string // 工具执行的工作目录
 	DataDir       string // 数据持久化目录
 }
@@ -62,15 +66,35 @@ func New(cfg Config) *Agent {
 	if cfg.DataDir == "" {
 		cfg.DataDir = "data"
 	}
+	if cfg.SkillsDir == "" {
+		cfg.SkillsDir = filepath.Join(cfg.DataDir, "skills")
+	}
+
+	skillStore := tools.NewSkillStore(cfg.SkillsDir)
+
+	registry := tools.DefaultRegistry()
+	registry.Register(tools.NewSkillTool(skillStore))
+
+	// 初始化 MCP 管理器
+	mcpConfigPath := filepath.Join(cfg.DataDir, "mcp.json")
+	mcpMgr := tools.NewMCPManager(mcpConfigPath)
+	if err := mcpMgr.LoadAndConnect(context.Background()); err != nil {
+		log.WithError(err).Warn("MCP initialization failed")
+	} else if mcpMgr.ServerCount() > 0 {
+		mcpMgr.RegisterTools(registry)
+	}
+
 	return &Agent{
 		bus:           cfg.Bus,
 		llmClient:     cfg.LLM,
 		model:         cfg.Model,
 		session:       session.New(cfg.SessionPath),
-		tools:         tools.DefaultRegistry(),
+		tools:         registry,
 		maxIterations: cfg.MaxIterations,
 		memoryWindow:  cfg.MemoryWindow,
 		memory:        NewMemoryStore(cfg.MemoryDir),
+		skills:        skillStore,
+		mcpManager:    mcpMgr,
 		workDir:       cfg.WorkDir,
 		dataDir:       cfg.DataDir,
 	}
@@ -79,6 +103,11 @@ func New(cfg Config) *Agent {
 // Run 启动 Agent 循环，持续消费入站消息
 func (a *Agent) Run(ctx context.Context) error {
 	log.Info("Agent loop started")
+	defer func() {
+		if a.mcpManager != nil {
+			a.mcpManager.Close()
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -129,9 +158,10 @@ func (a *Agent) processMessage(ctx context.Context, msg bus.InboundMessage) (*bu
 	// 检查是否需要触发自动记忆合并
 	a.maybeConsolidate(ctx)
 
-	// 构建 LLM 消息（注入长期记忆）
+	// 构建 LLM 消息（注入长期记忆和 skills）
 	history := a.session.GetHistory(a.memoryWindow)
-	messages := BuildMessages(history, msg.Content, msg.Channel, a.memory, a.memory.Dir(), a.workDir, a.dataDir)
+	skillsPrompt := a.skills.GetActiveSkillsPrompt()
+	messages := BuildMessages(history, msg.Content, msg.Channel, a.memory, a.memory.Dir(), a.workDir, a.dataDir, skillsPrompt)
 
 	// 运行 Agent 循环
 	finalContent, toolsUsed, err := a.runLoop(ctx, messages, msg.Channel, msg.ChatID)

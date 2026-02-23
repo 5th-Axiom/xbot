@@ -32,9 +32,9 @@ type cronJob struct {
 	Channel      string `json:"channel"`
 	ChatID       string `json:"chat_id"`
 	CronExpr     string `json:"cron_expr,omitempty"`
-	Timezone     string `json:"tz,omitempty"`
 	EverySeconds int    `json:"every_seconds,omitempty"`
-	At           string `json:"at,omitempty"` // ISO datetime for one-time
+	DelaySeconds int    `json:"delay_seconds,omitempty"` // one-shot delay
+	At           string `json:"at,omitempty"`            // ISO datetime for one-time
 	CreatedAt    string `json:"created_at"`
 
 	// 运行时字段（不持久化）
@@ -57,7 +57,7 @@ func (t *CronTool) Name() string { return "Cron" }
 
 func (t *CronTool) Description() string {
 	return `Schedule tasks that trigger the agent at specified times. Actions: add, list, remove.
-- add: create a job with message + one of (cron_expr, every_seconds, at). When triggered, the message is sent to the agent as a user message, initiating a full processing loop (LLM reasoning + tool calls + reply).
+- add: create a job with message + one of (cron_expr, every_seconds, delay_seconds, at). When triggered, the message is sent to the agent as a user message, initiating a full processing loop (LLM reasoning + tool calls + reply).
 - list: show all scheduled jobs
 - remove: delete a job by job_id`
 }
@@ -67,8 +67,8 @@ func (t *CronTool) Parameters() []llm.ToolParam {
 		{Name: "action", Type: "string", Description: "Action: add, list, remove", Required: true},
 		{Name: "message", Type: "string", Description: "Prompt sent to the agent when the job triggers. Write it as a user instruction, e.g. 'Check server status and report any issues' or 'Remind me to start the standup meeting'. The agent will process this as a normal user message.", Required: false},
 		{Name: "every_seconds", Type: "integer", Description: "Interval in seconds for recurring tasks", Required: false},
-		{Name: "cron_expr", Type: "string", Description: "Cron expression like '0 9 * * *' (5-field)", Required: false},
-		{Name: "tz", Type: "string", Description: "IANA timezone for cron expressions (default: Local)", Required: false},
+		{Name: "delay_seconds", Type: "integer", Description: "Execute once after this many seconds (one-shot delay)", Required: false},
+		{Name: "cron_expr", Type: "string", Description: "Cron expression like '0 9 * * *' (5-field, Local timezone)", Required: false},
 		{Name: "at", Type: "string", Description: "ISO datetime for one-time execution, e.g. '2026-02-12T10:30:00'", Required: false},
 		{Name: "job_id", Type: "string", Description: "Job ID (for remove)", Required: false},
 	}
@@ -78,8 +78,8 @@ type cronParams struct {
 	Action       string `json:"action"`
 	Message      string `json:"message"`
 	EverySeconds int    `json:"every_seconds"`
+	DelaySeconds int    `json:"delay_seconds"`
 	CronExpr     string `json:"cron_expr"`
-	Tz           string `json:"tz"`
 	At           string `json:"at"`
 	JobID        string `json:"job_id"`
 }
@@ -123,6 +123,7 @@ func (t *CronTool) addJob(ctx *ToolContext, p cronParams) (*ToolResult, error) {
 	// 必须指定调度方式
 	hasCron := p.CronExpr != ""
 	hasInterval := p.EverySeconds > 0
+	hasDelay := p.DelaySeconds > 0
 	hasAt := p.At != ""
 	count := 0
 	if hasCron {
@@ -131,14 +132,17 @@ func (t *CronTool) addJob(ctx *ToolContext, p cronParams) (*ToolResult, error) {
 	if hasInterval {
 		count++
 	}
+	if hasDelay {
+		count++
+	}
 	if hasAt {
 		count++
 	}
 	if count == 0 {
-		return nil, fmt.Errorf("must specify one of: cron_expr, every_seconds, at")
+		return nil, fmt.Errorf("must specify one of: cron_expr, every_seconds, delay_seconds, at")
 	}
 	if count > 1 {
-		return nil, fmt.Errorf("specify only one of: cron_expr, every_seconds, at")
+		return nil, fmt.Errorf("specify only one of: cron_expr, every_seconds, delay_seconds, at")
 	}
 
 	now := time.Now()
@@ -146,8 +150,8 @@ func (t *CronTool) addJob(ctx *ToolContext, p cronParams) (*ToolResult, error) {
 		ID:           fmt.Sprintf("job_%d", now.UnixMilli()),
 		Message:      p.Message,
 		CronExpr:     p.CronExpr,
-		Timezone:     p.Tz,
 		EverySeconds: p.EverySeconds,
+		DelaySeconds: p.DelaySeconds,
 		At:           p.At,
 		CreatedAt:    now.Format(time.RFC3339),
 	}
@@ -219,15 +223,8 @@ func (t *CronTool) removeJob(jobID string) (*ToolResult, error) {
 func (t *CronTool) initJobRuntime(job *cronJob) error {
 	now := time.Now()
 
-	// 解析时区
+	// 统一使用本地时区
 	job.location = time.Local
-	if job.Timezone != "" {
-		loc, err := time.LoadLocation(job.Timezone)
-		if err != nil {
-			return fmt.Errorf("invalid timezone %q: %w", job.Timezone, err)
-		}
-		job.location = loc
-	}
 
 	if job.At != "" {
 		// 一次性定时
@@ -243,6 +240,9 @@ func (t *CronTool) initJobRuntime(job *cronJob) error {
 			return fmt.Errorf("datetime %s is in the past", job.At)
 		}
 		job.nextRun = at
+		job.oneShot = true
+	} else if job.DelaySeconds > 0 {
+		job.nextRun = now.Add(time.Duration(job.DelaySeconds) * time.Second)
 		job.oneShot = true
 	} else if job.EverySeconds > 0 {
 		job.nextRun = now.Add(time.Duration(job.EverySeconds) * time.Second)
@@ -329,6 +329,15 @@ func (t *CronTool) scheduleDescription(job *cronJob) string {
 	if job.At != "" {
 		return fmt.Sprintf("once at %s", job.At)
 	}
+	if job.DelaySeconds > 0 {
+		if job.DelaySeconds >= 3600 {
+			return fmt.Sprintf("once after %dh%dm", job.DelaySeconds/3600, (job.DelaySeconds%3600)/60)
+		}
+		if job.DelaySeconds >= 60 {
+			return fmt.Sprintf("once after %dm%ds", job.DelaySeconds/60, job.DelaySeconds%60)
+		}
+		return fmt.Sprintf("once after %ds", job.DelaySeconds)
+	}
 	if job.EverySeconds > 0 {
 		if job.EverySeconds >= 3600 {
 			return fmt.Sprintf("every %dh%dm", job.EverySeconds/3600, (job.EverySeconds%3600)/60)
@@ -339,11 +348,7 @@ func (t *CronTool) scheduleDescription(job *cronJob) string {
 		return fmt.Sprintf("every %ds", job.EverySeconds)
 	}
 	if job.CronExpr != "" {
-		tz := job.Timezone
-		if tz == "" {
-			tz = "Local"
-		}
-		return fmt.Sprintf("cron(%s) tz=%s", job.CronExpr, tz)
+		return fmt.Sprintf("cron(%s)", job.CronExpr)
 	}
 	return "unknown"
 }
