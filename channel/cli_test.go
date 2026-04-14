@@ -646,6 +646,7 @@ func TestCLIModelUpdateCtrlCWhileTyping(t *testing.T) {
 func TestCLIModelUpdateProgressMsg(t *testing.T) {
 	model := newCLIModel()
 	model.handleResize(80, 24)
+	model.typing = true // simulate active agent turn
 
 	// Send progress message
 	progMsg := cliProgressMsg{
@@ -695,6 +696,29 @@ func TestCLIModelUpdateProgressNilPayload(t *testing.T) {
 	_, _ = model.Update(progMsg)
 
 	// Should not panic
+}
+
+func TestCLIModelStaleProgressIgnored(t *testing.T) {
+	model := newCLIModel()
+	model.handleResize(80, 24)
+
+	// Simulate: turn already ended (typing=false, progress=nil)
+	model.typing = false
+	model.progress = nil
+
+	// A stale non-done progress event should be silently ignored
+	progMsg := cliProgressMsg{
+		payload: &CLIProgressPayload{
+			Phase:     "thinking",
+			Iteration: 1,
+			SubAgents: []CLISubAgent{{Role: "explore", Status: "running", Desc: "exploring"}},
+		},
+	}
+	_, _ = model.Update(progMsg)
+
+	if model.progress != nil {
+		t.Error("Stale progress event should be ignored when turn has ended")
+	}
 }
 
 func TestCLIModelUpdateWindowSizeMsg(t *testing.T) {

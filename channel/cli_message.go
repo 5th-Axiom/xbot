@@ -863,8 +863,19 @@ func (m *cliModel) renderProgressBlock() string {
 		}
 		isReasoningStreaming := m.progress.ReasoningStreamContent != "" && m.progress.StreamContent == ""
 		if reasoningText != "" {
+			// Typewriter effect for reasoning streaming content
+			totalReasoningRunes := len([]rune(m.progress.ReasoningStreamContent))
+			if isReasoningStreaming && totalReasoningRunes > 0 {
+				runes := []rune(m.progress.ReasoningStreamContent)
+				if m.rwVisible > 0 && m.rwVisible < totalReasoningRunes {
+					runes = runes[:m.rwVisible]
+				}
+				reasoningText = string(runes)
+			}
 			lines := strings.Split(reasoningText, "\n")
-			cursorVisible := (m.ticker.ticks/5)%2 == 0
+			// Solid cursor while actively typing; blink only when waiting for next chunk.
+			reasoningTyping := isReasoningStreaming && m.rwVisible < totalReasoningRunes
+			cursorVisible := reasoningTyping || (m.ticker.ticks/5)%2 == 0
 			for i, line := range lines {
 				line = strings.TrimRight(line, " \t\r")
 				if line == "" {
@@ -955,9 +966,18 @@ func (m *cliModel) renderProgressBlock() string {
 
 		// Stream content: render LLM output in progress block when streaming
 		if m.progress.StreamContent != "" {
-			lines := strings.Split(m.progress.StreamContent, "\n")
-			// Blinking cursor: visible for 5 ticks (500ms), hidden for 5 ticks
-			cursorVisible := (m.ticker.ticks/5)%2 == 0
+			// Typewriter effect: gradually reveal characters
+			totalRunes := len([]rune(m.progress.StreamContent))
+			runes := []rune(m.progress.StreamContent)
+			if m.twVisible > 0 && m.twVisible < totalRunes {
+				runes = runes[:m.twVisible]
+			}
+			streamText := string(runes)
+			lines := strings.Split(streamText, "\n")
+			// Blinking cursor: only blink when waiting for next stream chunk.
+			// While actively typing (behind buffer), cursor stays solid.
+			typing := m.twVisible < totalRunes
+			cursorVisible := typing || (m.ticker.ticks/5)%2 == 0
 			for i, line := range lines {
 				line = strings.TrimRight(line, " \t\r")
 				if line == "" {
@@ -998,7 +1018,7 @@ func (m *cliModel) renderProgressBlock() string {
 		// SubAgent tree
 		if len(m.progress.SubAgents) > 0 {
 			var treeSB strings.Builder
-			m.renderSubAgentTree(&treeSB, m.progress.SubAgents, 1, innerWidth)
+			m.renderSubAgentTree(&treeSB, m.progress.SubAgents, "", innerWidth)
 			if treeSB.Len() > 0 {
 				sb.WriteString("\n")
 				sb.WriteString(treeSB.String())
@@ -1035,26 +1055,19 @@ func (m *cliModel) renderProgressBlock() string {
 // renderSubAgentTree renders nested sub-agents with indentation.
 // Only renders running/pending agents — completed or errored ones are already
 // captured in the tool summary and shouldn't linger in the progress panel.
-func (m *cliModel) renderSubAgentTree(sb *strings.Builder, agents []CLISubAgent, depth int, maxWidth int) {
+//
+// Uses a prefix-based approach instead of depth-based: each level appends
+// "│   " or "    " to the prefix depending on whether the parent was the last
+// sibling. This avoids spurious vertical lines after a └── branch.
+func (m *cliModel) renderSubAgentTree(sb *strings.Builder, agents []CLISubAgent, prefix string, maxWidth int) {
 	for i, sa := range agents {
 		if sa.Status == "done" || sa.Status == "error" {
 			continue
 		}
-		// §22 树状连接线
-		prefix := ""
-		if depth == 1 {
-			if i == len(agents)-1 {
-				prefix = "└── "
-			} else {
-				prefix = "├── "
-			}
-		} else {
-			indent := strings.Repeat("│   ", depth-1)
-			if i == len(agents)-1 {
-				prefix = indent + "└── "
-			} else {
-				prefix = indent + "├── "
-			}
+		isLast := i == len(agents)-1
+		connector := "└── "
+		if !isLast {
+			connector = "├── "
 		}
 		icon := m.ticker.viewFrames(waveFrames)
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color(RoleColor(sa.Role)))
@@ -1063,7 +1076,7 @@ func (m *cliModel) renderSubAgentTree(sb *strings.Builder, agents []CLISubAgent,
 			icon = "✗"
 			style = m.styles.ProgressError
 		}
-		line := fmt.Sprintf("%s%s %s", prefix, icon, sa.Role)
+		line := fmt.Sprintf("%s%s%s %s", prefix, connector, icon, sa.Role)
 		if sa.Desc != "" {
 			// Truncate Desc separately to account for prefix+icon+role overhead.
 			overhead := lipgloss.Width(line) + 2 // +2 for ": "
@@ -1076,7 +1089,13 @@ func (m *cliModel) renderSubAgentTree(sb *strings.Builder, agents []CLISubAgent,
 		sb.WriteString(style.Render(line))
 		sb.WriteString("\n")
 		if len(sa.Children) > 0 {
-			m.renderSubAgentTree(sb, sa.Children, depth+1, maxWidth)
+			childPrefix := prefix
+			if isLast {
+				childPrefix += "    "
+			} else {
+				childPrefix += "│   "
+			}
+			m.renderSubAgentTree(sb, sa.Children, childPrefix, maxWidth)
 		}
 	}
 }
@@ -1751,6 +1770,14 @@ func (m *cliModel) jumpToSearchResult(idx int) {
 func tickCmd() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
 		return cliTickMsg{}
+	})
+}
+
+// typewriterTickCmd returns a command that advances the typewriter by 1 rune every 50ms.
+// Runs independently from the main tick to give the typewriter its own update frequency.
+func typewriterTickCmd() tea.Cmd {
+	return tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg {
+		return typewriterTickMsg{}
 	})
 }
 
