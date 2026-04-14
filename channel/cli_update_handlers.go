@@ -276,6 +276,16 @@ func (m *cliModel) handleKeyPress(msg tea.KeyPressMsg, wasTyping bool) (tea.Mode
 func (m *cliModel) handleProgressMsg(msg cliProgressMsg) {
 	turnID := m.agentTurnID // capture before any mutation
 	prev := m.progress
+
+	// Guard: ignore stale progress events arriving after the turn has ended.
+	// Without this, a late progress event (especially from SubAgent callbacks
+	// running in separate goroutines) can re-set m.progress to non-nil after
+	// endAgentTurn cleared it, causing the progress panel to persist.
+	// PhaseDone is still allowed through: it's idempotent (endAgentTurn checks turnID).
+	if !m.typing && msg.payload != nil && msg.payload.Phase != "done" {
+		return
+	}
+
 	// Stream-only payloads (from StreamContentFunc/StreamReasoningFunc) only carry
 	// stream content fields. Merge into existing progress instead of replacing to
 	// preserve tool/iteration state.
@@ -322,6 +332,23 @@ func (m *cliModel) handleProgressMsg(msg cliProgressMsg) {
 					t.StartedAt = time.Now()
 				}
 			}
+		}
+	}
+	// Preserve SubAgent tree across progress updates.
+	// Progress events may arrive with incomplete subagent data (missing deep
+	// nodes) or no subagent data at all. We preserve the deepest tree seen
+	// during the current turn to prevent the TUI from losing deep agent nodes.
+	// PhaseDone is the exception — it intentionally clears the tree.
+	if m.progress != nil && m.progress.Phase != "done" && prev != nil {
+		newDepth := maxTreeDepth(m.progress.SubAgents)
+		prevDepth := maxTreeDepth(prev.SubAgents)
+		if len(m.progress.SubAgents) == 0 && len(prev.SubAgents) > 0 {
+			// New payload has no tree — carry forward old tree
+			m.progress.SubAgents = prev.SubAgents
+		} else if newDepth < prevDepth && newDepth > 0 {
+			// New tree is shallower than old — carry forward old tree
+			// (deeper nodes are still running even if this event didn't include them)
+			m.progress.SubAgents = prev.SubAgents
 		}
 	}
 	// Update bg task count from callback
@@ -626,4 +653,18 @@ func (m *cliModel) handleToastClear(msg cliToastClearMsg) []tea.Cmd {
 	}
 	m.toastTimer = false
 	return nil
+}
+
+// maxTreeDepth returns the maximum depth of the SubAgent tree (1 for top-level nodes).
+func maxTreeDepth(agents []CLISubAgent) int {
+	if len(agents) == 0 {
+		return 0
+	}
+	max := 1
+	for _, a := range agents {
+		if d := maxTreeDepth(a.Children); d+1 > max {
+			max = d + 1
+		}
+	}
+	return max
 }
