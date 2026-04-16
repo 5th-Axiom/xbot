@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,7 +31,7 @@ import (
 
 // injectProxyLLM checks if the user's active runner has local LLM configured,
 // and if so, injects a ProxyLLM into the agent's LLM factory.
-func injectProxyLLM(userID string, agentLoop *agent.Agent) {
+func injectProxyLLM(userID string, backend agent.AgentBackend) {
 	db := tools.GetRunnerTokenDB()
 	if db == nil {
 		return
@@ -72,12 +74,12 @@ func injectProxyLLM(userID string, agentLoop *agent.Agent) {
 				}
 				model := llm.Model
 				if model == "" {
-					model = agentLoop.GetDefaultModel()
+					model = backend.GetDefaultModel()
 				}
-				agentLoop.SetProxyLLM(userID, proxy, model)
+				backend.SetProxyLLM(userID, proxy, model)
 				log.Infof("ProxyLLM injected for user=%s runner=%s provider=%s", userID, activeName, llm.Provider)
 			} else {
-				agentLoop.ClearProxyLLM(userID)
+				backend.ClearProxyLLM(userID)
 			}
 			return
 		}
@@ -124,9 +126,585 @@ func setupOAuth(cfg *config.Config, dbPath string) (*oauth.Server, *oauth.Manage
 	return oauthServer, oauthManager, feishuProvider, sharedDB, nil
 }
 
+// maskAPIKey masks an API key for safe transport over WS RPC.
+// Shows first 4 chars + "****" so users can identify the key.
+func maskAPIKey(key string) string {
+	if len(key) <= 4 {
+		return "****"
+	}
+	return key[:4] + "****"
+}
+
+// handleCLIRPC dispatches RPC requests from CLI RemoteBackend clients
+// to the server's LocalBackend. This is the server-side counterpart of
+// RemoteBackend.callRPC().
+func handleCLIRPC(cfg *config.Config, backend agent.AgentBackend, method string, params json.RawMessage, senderID string) (json.RawMessage, error) {
+	switch method {
+	// --- Context / settings ---
+	case "get_context_mode":
+		return json.Marshal(backend.GetContextMode())
+	case "set_context_mode":
+		var p struct {
+			Mode string `json:"mode"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, backend.SetContextMode(p.Mode)
+	case "get_settings":
+		var p struct {
+			Namespace string `json:"namespace"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.SettingsService() == nil {
+			return nil, fmt.Errorf("settings service not available")
+		}
+		result, err := backend.SettingsService().GetSettings(p.Namespace, senderID)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+	case "set_setting":
+		var p struct {
+			Namespace string `json:"namespace"`
+			Key       string `json:"key"`
+			Value     string `json:"value"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.SettingsService() == nil {
+			return nil, fmt.Errorf("settings service not available")
+		}
+		return nil, backend.SettingsService().SetSetting(p.Namespace, senderID, p.Key, p.Value)
+
+	// --- Max iterations / concurrency / context tokens ---
+	case "set_max_iterations":
+		var p struct {
+			N int `json:"n"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		backend.SetMaxIterations(p.N)
+		return nil, nil
+	case "set_max_concurrency":
+		var p struct {
+			N int `json:"n"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		backend.SetMaxConcurrency(p.N)
+		return nil, nil
+	case "set_max_context_tokens":
+		var p struct {
+			N int `json:"n"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		backend.SetMaxContextTokens(p.N)
+		return nil, nil
+
+	// --- LLM ---
+	case "get_default_model":
+		return json.Marshal(backend.GetDefaultModel())
+	case "set_user_model":
+		var p struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, backend.SetUserModel(senderID, p.Model)
+	case "get_user_max_context":
+		return json.Marshal(backend.GetUserMaxContext(senderID))
+	case "set_user_max_context":
+		var p struct {
+			MaxContext int `json:"max_context"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, backend.SetUserMaxContext(senderID, p.MaxContext)
+	case "get_user_max_output_tokens":
+		return json.Marshal(backend.GetUserMaxOutputTokens(senderID))
+	case "set_user_max_output_tokens":
+		var p struct {
+			MaxTokens int `json:"max_tokens"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, backend.SetUserMaxOutputTokens(senderID, p.MaxTokens)
+	case "get_user_thinking_mode":
+		return json.Marshal(backend.GetUserThinkingMode(senderID))
+	case "set_user_thinking_mode":
+		var p struct {
+			Mode string `json:"mode"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, backend.SetUserThinkingMode(senderID, p.Mode)
+	case "get_llm_concurrency":
+		return json.Marshal(backend.GetLLMConcurrency(senderID))
+	case "set_llm_concurrency":
+		var p struct {
+			Personal int `json:"personal"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, backend.SetLLMConcurrency(senderID, p.Personal)
+	case "set_default_thinking_mode":
+		var p struct {
+			Mode string `json:"mode"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		backend.LLMFactory().SetDefaultThinkingMode(p.Mode)
+		return nil, nil
+	case "list_models":
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		return json.Marshal(backend.LLMFactory().ListModels())
+	case "list_all_models":
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		return json.Marshal(backend.LLMFactory().ListAllModelsForUser(senderID))
+	case "set_model_tiers":
+		if senderID != "admin" {
+			return nil, fmt.Errorf("admin only")
+		}
+		var llmCfg config.LLMConfig
+		if err := json.Unmarshal(params, &llmCfg); err != nil {
+			return nil, err
+		}
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		backend.LLMFactory().SetModelTiers(llmCfg)
+		return nil, nil
+	case "set_proxy_llm":
+		var p struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		// CLI remote mode uses this RPC to switch the server-side model.
+		// SetProxyLLM(nil) would store a nil client and crash GetLLM,
+		// so use SwitchModel instead which only updates the cached model name.
+		if backend.LLMFactory() != nil {
+			backend.LLMFactory().SwitchModel(senderID, p.Model)
+		}
+		return nil, nil
+	case "clear_proxy_llm":
+		backend.ClearProxyLLM(senderID)
+		return nil, nil
+
+	// --- Memory ---
+	case "clear_memory":
+		var p struct {
+			Channel    string `json:"channel"`
+			ChatID     string `json:"chat_id"`
+			TargetType string `json:"target_type"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.MultiSession() == nil {
+			return nil, fmt.Errorf("multi-session not available")
+		}
+		// Non-admin users can only clear their own memory
+		if senderID != "admin" && p.ChatID != "" && p.ChatID != senderID {
+			return nil, fmt.Errorf("access denied")
+		}
+		if p.ChatID == "" {
+			p.ChatID = senderID
+		}
+		return nil, backend.MultiSession().ClearMemory(context.Background(), p.Channel, p.ChatID, p.TargetType, senderID)
+	case "get_memory_stats":
+		var p struct {
+			Channel string `json:"channel"`
+			ChatID  string `json:"chat_id"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.MultiSession() == nil {
+			return nil, fmt.Errorf("multi-session not available")
+		}
+		// Non-admin users can only view their own memory stats
+		if senderID != "admin" && p.ChatID != "" && p.ChatID != senderID {
+			return nil, fmt.Errorf("access denied")
+		}
+		if p.ChatID == "" {
+			p.ChatID = senderID
+		}
+		result := backend.MultiSession().GetMemoryStats(context.Background(), p.Channel, p.ChatID, senderID)
+		return json.Marshal(result)
+	case "get_user_token_usage":
+		if backend.MultiSession() == nil {
+			return nil, fmt.Errorf("multi-session not available")
+		}
+		usage, err := backend.MultiSession().GetUserTokenUsage(senderID)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(usage)
+	case "get_daily_token_usage":
+		var p struct {
+			Days int `json:"days"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.MultiSession() == nil {
+			return nil, fmt.Errorf("multi-session not available")
+		}
+		daily, err := backend.MultiSession().GetDailyTokenUsage(senderID, p.Days)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(daily)
+
+		// --- Sub-agents ---
+	case "count_interactive_sessions":
+		var p struct {
+			Channel string `json:"channel"`
+			ChatID  string `json:"chat_id"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if senderID != "admin" && p.ChatID != "" && p.ChatID != senderID {
+			return nil, fmt.Errorf("access denied")
+		}
+		if p.ChatID == "" {
+			p.ChatID = senderID
+		}
+		return json.Marshal(backend.CountInteractiveSessions(p.Channel, p.ChatID))
+	case "list_interactive_sessions":
+		var p struct {
+			Channel string `json:"channel"`
+			ChatID  string `json:"chat_id"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if senderID != "admin" && p.ChatID != "" && p.ChatID != senderID {
+			return nil, fmt.Errorf("access denied")
+		}
+		if p.ChatID == "" {
+			p.ChatID = senderID
+		}
+		return json.Marshal(backend.ListInteractiveSessions(p.Channel, p.ChatID))
+	case "inspect_interactive_session":
+		var p struct {
+			Role      string `json:"role"`
+			Channel   string `json:"channel"`
+			ChatID    string `json:"chat_id"`
+			Instance  string `json:"instance"`
+			TailCount int    `json:"tail_count"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if senderID != "admin" && p.ChatID != "" && p.ChatID != senderID {
+			return nil, fmt.Errorf("access denied")
+		}
+		if p.ChatID == "" {
+			p.ChatID = senderID
+		}
+		result, err := backend.InspectInteractiveSession(context.Background(), p.Role, p.Channel, p.ChatID, p.Instance, p.TailCount)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+
+	// --- Background tasks ---
+	case "get_bg_task_count":
+		var p struct {
+			SessionKey string `json:"session_key"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.BgTaskManager() == nil {
+			return json.Marshal(0)
+		}
+		return json.Marshal(len(backend.BgTaskManager().List(p.SessionKey)))
+
+	// --- History ---
+	case "get_history":
+		var p struct {
+			Channel string `json:"channel"`
+			ChatID  string `json:"chat_id"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		// If client doesn't send channel/chatID, fall back to auth context.
+		if p.Channel == "" {
+			p.Channel = "web"
+		}
+		if p.ChatID == "" {
+			p.ChatID = senderID
+		}
+		if senderID != "admin" && p.ChatID != senderID {
+			return nil, fmt.Errorf("access denied")
+		}
+		history, err := backend.GetHistory(p.Channel, p.ChatID)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(history)
+	case "trim_history":
+		var p struct {
+			Channel string `json:"channel"`
+			ChatID  string `json:"chat_id"`
+			Cutoff  string `json:"cutoff"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if p.Channel == "" {
+			p.Channel = "web"
+		}
+		if p.ChatID == "" {
+			p.ChatID = senderID
+		}
+		if senderID != "admin" && p.ChatID != senderID {
+			return nil, fmt.Errorf("access denied")
+		}
+		var cutoff time.Time
+		if p.Cutoff != "" {
+			var err error
+			cutoff, err = time.Parse(time.RFC3339, p.Cutoff)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cutoff format: %w", err)
+			}
+		}
+		return nil, backend.TrimHistory(p.Channel, p.ChatID, cutoff)
+
+	// --- Subscriptions ---
+	case "list_subscriptions":
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		svc := backend.LLMFactory().GetSubscriptionSvc()
+		if svc == nil {
+			return json.Marshal([]channel.Subscription{})
+		}
+		subs, err := svc.List(senderID)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]channel.Subscription, len(subs))
+		for i, s := range subs {
+			result[i] = channel.Subscription{
+				ID: s.ID, Name: s.Name, Provider: s.Provider,
+				BaseURL: s.BaseURL, APIKey: maskAPIKey(s.APIKey),
+				Model: s.Model, Active: s.IsDefault,
+			}
+		}
+		return json.Marshal(result)
+	case "get_default_subscription":
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		svc := backend.LLMFactory().GetSubscriptionSvc()
+		if svc == nil {
+			return nil, nil
+		}
+		sub, err := svc.GetDefault(senderID)
+		if err != nil || sub == nil {
+			return nil, err
+		}
+		return json.Marshal(channel.Subscription{
+			ID: sub.ID, Name: sub.Name, Provider: sub.Provider,
+			BaseURL: sub.BaseURL, APIKey: maskAPIKey(sub.APIKey),
+			Model: sub.Model, Active: sub.IsDefault,
+		})
+	case "add_subscription":
+		var p struct {
+			Sub sqlite.LLMSubscription `json:"sub"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		svc := backend.LLMFactory().GetSubscriptionSvc()
+		if svc == nil {
+			return nil, fmt.Errorf("subscription service not available")
+		}
+		p.Sub.SenderID = senderID
+		return nil, svc.Add(&p.Sub)
+	case "update_subscription":
+		var p struct {
+			ID  string                 `json:"id"`
+			Sub sqlite.LLMSubscription `json:"sub"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		svc := backend.LLMFactory().GetSubscriptionSvc()
+		if svc == nil {
+			return nil, fmt.Errorf("subscription service not available")
+		}
+		// Non-admin users can only update their own subscriptions
+		existing, err := svc.Get(p.ID)
+		if err != nil {
+			return nil, err
+		}
+		if senderID != "admin" && existing.SenderID != senderID {
+			return nil, fmt.Errorf("subscription not found")
+		}
+		p.Sub.ID = p.ID
+		p.Sub.SenderID = existing.SenderID // preserve owner
+		// If client sent a masked API key (user didn't change it),
+		// preserve the original key to avoid corrupting credentials.
+		if strings.HasSuffix(p.Sub.APIKey, "****") {
+			p.Sub.APIKey = existing.APIKey
+		}
+		if err := svc.Update(&p.Sub); err != nil {
+			return nil, err
+		}
+		backend.LLMFactory().Invalidate(existing.SenderID)
+		return nil, nil
+	case "remove_subscription":
+		var p struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		svc := backend.LLMFactory().GetSubscriptionSvc()
+		if svc == nil {
+			return nil, fmt.Errorf("subscription service not available")
+		}
+		// Get subscription for ownership check and cache invalidation
+		sub, err := svc.Get(p.ID)
+		if err != nil {
+			return nil, err
+		}
+		// Non-admin users can only remove their own subscriptions
+		if senderID != "admin" && sub.SenderID != senderID {
+			return nil, fmt.Errorf("subscription not found")
+		}
+		if err := svc.Remove(p.ID); err != nil {
+			return nil, err
+		}
+		backend.LLMFactory().Invalidate(sub.SenderID)
+		return nil, nil
+	case "set_default_subscription":
+		var p struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		svc := backend.LLMFactory().GetSubscriptionSvc()
+		if svc == nil {
+			return nil, fmt.Errorf("subscription service not available")
+		}
+		// Non-admin users can only set their own subscription as default
+		sub, err := svc.Get(p.ID)
+		if err != nil {
+			return nil, err
+		}
+		if senderID != "admin" && sub.SenderID != senderID {
+			return nil, fmt.Errorf("subscription not found")
+		}
+		if err := svc.SetDefault(p.ID); err != nil {
+			return nil, err
+		}
+		backend.LLMFactory().Invalidate(sub.SenderID)
+		return nil, nil
+	case "rename_subscription":
+		var p struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		svc := backend.LLMFactory().GetSubscriptionSvc()
+		if svc == nil {
+			return nil, fmt.Errorf("subscription service not available")
+		}
+		// Non-admin users can only rename their own subscriptions
+		sub, err := svc.Get(p.ID)
+		if err != nil {
+			return nil, err
+		}
+		if senderID != "admin" && sub.SenderID != senderID {
+			return nil, fmt.Errorf("subscription not found")
+		}
+		return nil, svc.Rename(p.ID, p.Name)
+
+	case "set_subscription_model":
+		var p struct {
+			ID    string `json:"id"`
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		if backend.LLMFactory() == nil {
+			return nil, fmt.Errorf("LLM factory not available")
+		}
+		svc := backend.LLMFactory().GetSubscriptionSvc()
+		if svc == nil {
+			return nil, fmt.Errorf("subscription service not available")
+		}
+		// Non-admin users can only modify their own subscriptions
+		sub, err := svc.Get(p.ID)
+		if err != nil {
+			return nil, err
+		}
+		if senderID != "admin" && sub.SenderID != senderID {
+			return nil, fmt.Errorf("subscription not found")
+		}
+		return nil, svc.SetModel(p.ID, p.Model)
+
+	case "reset_token_state":
+		backend.ResetTokenState()
+		return nil, nil
+
+	default:
+		return nil, fmt.Errorf("unknown RPC method: %s", method)
+	}
+}
+
 // buildWebCallbacks creates WebCallbacks with all Runner/Registry closures.
-func buildWebCallbacks(cfg *config.Config, agentLoop *agent.Agent) channel.WebCallbacks {
-	return channel.WebCallbacks{
+func buildWebCallbacks(cfg *config.Config, backend agent.AgentBackend) channel.WebCallbacks {
+	callbacks := channel.WebCallbacks{
 		RunnerTokenGet: func(senderID string) string {
 			db := tools.GetRunnerTokenDB()
 			if db == nil {
@@ -251,36 +829,36 @@ func buildWebCallbacks(cfg *config.Config, agentLoop *agent.Agent) channel.WebCa
 		},
 
 		RegistryBrowse: func(entryType string, limit, offset int) ([]sqlite.SharedEntry, error) {
-			return agentLoop.RegistryManager().Browse(entryType, limit, offset)
+			return backend.RegistryManager().Browse(entryType, limit, offset)
 		},
 		RegistryInstall: func(entryType string, id int64, senderID string) error {
-			return agentLoop.RegistryManager().Install(entryType, id, senderID)
+			return backend.RegistryManager().Install(entryType, id, senderID)
 		},
 		RegistryListMy: func(senderID, entryType string) ([]sqlite.SharedEntry, []string, error) {
-			return agentLoop.RegistryManager().ListMy(senderID, entryType)
+			return backend.RegistryManager().ListMy(senderID, entryType)
 		},
 		RegistryPublish: func(entryType, name, senderID string) error {
-			return agentLoop.RegistryManager().Publish(entryType, name, senderID)
+			return backend.RegistryManager().Publish(entryType, name, senderID)
 		},
 		RegistryUnpublish: func(entryType, name, senderID string) error {
-			return agentLoop.RegistryManager().Unpublish(entryType, name, senderID)
+			return backend.RegistryManager().Unpublish(entryType, name, senderID)
 		},
 
 		RegistryUninstall: func(entryType, name, senderID string) error {
-			return agentLoop.RegistryManager().Uninstall(entryType, name, senderID)
+			return backend.RegistryManager().Uninstall(entryType, name, senderID)
 		},
 		LLMList: func(senderID string) ([]string, string) {
-			llmClient, currentModel, _, _ := agentLoop.LLMFactory().GetLLM(senderID)
+			llmClient, currentModel, _, _ := backend.LLMFactory().GetLLM(senderID)
 			return llmClient.ListModels(), currentModel
 		},
 		LLMSet: func(senderID, model string) error {
-			return agentLoop.SetUserModel(senderID, model)
+			return backend.SetUserModel(senderID, model)
 		},
 		LLMGetMaxContext: func(senderID string) int {
-			return agentLoop.GetUserMaxContext(senderID)
+			return backend.GetUserMaxContext(senderID)
 		},
 		LLMSetMaxContext: func(senderID string, maxContext int) error {
-			return agentLoop.SetUserMaxContext(senderID, maxContext)
+			return backend.SetUserMaxContext(senderID, maxContext)
 		},
 
 		SandboxWriteFile: func(senderID string, sandboxRelPath string, data []byte, perm os.FileMode) (string, error) {
@@ -314,10 +892,15 @@ func buildWebCallbacks(cfg *config.Config, agentLoop *agent.Agent) channel.WebCa
 			return ws, nil
 		},
 	}
+	// Wire RPC handler for CLI RemoteBackend clients
+	callbacks.RPCHandler = func(method string, params json.RawMessage, senderID string) (json.RawMessage, error) {
+		return handleCLIRPC(cfg, backend, method, params, senderID)
+	}
+	return callbacks
 }
 
 // registerChannels creates and registers all channels.
-func registerChannels(disp *channel.Dispatcher, cfg *config.Config, msgBus *bus.MessageBus, agentLoop *agent.Agent, webDB *sql.DB, workDir string) (*channel.FeishuChannel, error) {
+func registerChannels(disp *channel.Dispatcher, cfg *config.Config, msgBus *bus.MessageBus, backend agent.AgentBackend, webDB *sql.DB, workDir string) (*channel.FeishuChannel, error) {
 	var feishuCh *channel.FeishuChannel
 	if cfg.Feishu.Enabled {
 		feishuCh = channel.NewFeishuChannel(channel.FeishuConfig{
@@ -354,12 +937,12 @@ func registerChannels(disp *channel.Dispatcher, cfg *config.Config, msgBus *bus.
 	if cfg.Web.Enable {
 		if webDB != nil {
 			webCh := channel.NewWebChannel(channel.WebChannelConfig{
-				Host:             cfg.Web.Host,
-				Port:             cfg.Web.Port,
-				DB:               webDB,
-				FeishuLinkSecret: cfg.Feishu.AppSecret,
-				InviteOnly:       cfg.Web.InviteOnly,
-				PublicURL:        cfg.Sandbox.PublicURL,
+				Host:       cfg.Web.Host,
+				Port:       cfg.Web.Port,
+				DB:         webDB,
+				AdminToken: cfg.Admin.Token,
+				InviteOnly: cfg.Web.InviteOnly,
+				PublicURL:  cfg.Sandbox.PublicURL,
 			}, msgBus)
 			if cfg.Web.StaticDir != "" {
 				webCh.SetStaticDir(cfg.Web.StaticDir)
@@ -387,7 +970,7 @@ func registerChannels(disp *channel.Dispatcher, cfg *config.Config, msgBus *bus.
 				}
 			}
 
-			webCh.SetCallbacks(buildWebCallbacks(cfg, agentLoop))
+			webCh.SetCallbacks(buildWebCallbacks(cfg, backend))
 			// Wire up RemoteSandbox callbacks to push real-time status to WebChannel.
 			// In WebChannel, senderID == chatID (see handleWS: client.userID = senderID, chatID := c.userID).
 			if router, ok := tools.GetSandbox().(*tools.SandboxRouter); ok {
@@ -396,9 +979,9 @@ func registerChannels(disp *channel.Dispatcher, cfg *config.Config, msgBus *bus.
 						webCh.PushRunnerStatus(userID, runnerName, online)
 						// When a runner with local LLM connects/disconnects, update ProxyLLM.
 						if online {
-							injectProxyLLM(userID, agentLoop)
+							injectProxyLLM(userID, backend)
 						} else {
-							agentLoop.ClearProxyLLM(userID)
+							backend.ClearProxyLLM(userID)
 						}
 					}
 					remote.OnSyncProgress = func(userID, phase, message string) {
@@ -442,52 +1025,19 @@ func main() {
 		log.WithError(err).Fatal("Failed to setup OAuth")
 	}
 
-	// 嵌入向量配置（Letta 归档记忆使用 chromem-go）
-	embBaseURL := cfg.Embedding.BaseURL
-	if embBaseURL == "" {
-		embBaseURL = cfg.LLM.BaseURL // 回退到 LLM 的 base URL
-	}
-	embAPIKey := cfg.Embedding.APIKey
-	if embAPIKey == "" {
-		embAPIKey = cfg.LLM.APIKey
-	}
-
 	// 初始化沙箱
 	tools.InitSandbox(cfg.Sandbox, workDir)
 
-	agentLoop := agent.New(agent.Config{
-		Bus:                  msgBus,
-		LLM:                  llmClient,
-		Model:                cfg.LLM.Model,
-		MaxIterations:        cfg.Agent.MaxIterations,
-		MaxConcurrency:       cfg.Agent.MaxConcurrency,
-		DBPath:               dbPath,
-		SkillsDir:            filepath.Join(xbotDir, "skills"),
-		AgentsDir:            filepath.Join(xbotDir, "agents"),
-		WorkDir:              workDir,
-		XbotHome:             xbotDir,
-		PromptFile:           cfg.Agent.PromptFile,
-		SingleUser:           false, // Deprecated: no longer used
-		SandboxMode:          cfg.Sandbox.Mode,
-		Sandbox:              tools.GetSandbox(),
-		MemoryProvider:       cfg.Agent.MemoryProvider,
-		EmbeddingProvider:    cfg.Embedding.Provider,
-		EmbeddingBaseURL:     embBaseURL,
-		EmbeddingAPIKey:      embAPIKey,
-		EmbeddingModel:       cfg.Embedding.Model,
-		EmbeddingMaxTokens:   cfg.Embedding.MaxTokens,
-		MCPInactivityTimeout: cfg.Agent.MCPInactivityTimeout,
-		MCPCleanupInterval:   cfg.Agent.MCPCleanupInterval,
-		SessionCacheTimeout:  cfg.Agent.SessionCacheTimeout,
-		EnableAutoCompress:   cfg.Agent.EffectiveEnableAutoCompress(),
-		MaxContextTokens:     cfg.Agent.MaxContextTokens,
-		CompressionThreshold: cfg.Agent.CompressionThreshold,
-		ContextMode:          agent.ContextMode(cfg.Agent.ContextMode),
-		MaxSubAgentDepth:     cfg.Agent.MaxSubAgentDepth,
-		PersonaIsolation:     cfg.Web.PersonaIsolation,
-		PurgeOldMessages:     cfg.Agent.PurgeOldMessages,
-		SandboxIdleTimeout:   cfg.Sandbox.IdleTimeout,
-	})
+	bc := agent.BackendConfig{
+		Cfg:              cfg,
+		LLM:              llmClient,
+		Bus:              msgBus,
+		DBPath:           dbPath,
+		WorkDir:          workDir,
+		XbotHome:         xbotDir,
+		PersonaIsolation: cfg.Web.PersonaIsolation,
+	}
+	backend := agent.NewLocalBackend(bc.AgentConfig())
 
 	// 注册 OAuth 和 Feishu MCP 工具（如果启用）
 	if cfg.OAuth.Enable && oauthManager != nil {
@@ -496,73 +1046,73 @@ func main() {
 			Manager: oauthManager,
 			BaseURL: cfg.OAuth.BaseURL,
 		}
-		agentLoop.RegisterCoreTool(oauthTool)
+		backend.RegisterCoreTool(oauthTool)
 
 		// 注册 Feishu MCP 工具
 		feishuMCP := feishu_mcp.NewFeishuMCP(oauthManager, cfg.Feishu.AppID, cfg.Feishu.AppSecret)
 		if feishuProvider != nil {
 			feishuMCP.SetLarkClient(feishuProvider.GetLarkClient())
 		}
-		agentLoop.RegisterTool(&feishu_mcp.ListAllBitablesTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.BitableFieldsTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.BitableRecordTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.BitableListTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.BatchCreateAppTableRecordTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.ListAllBitablesTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.BitableFieldsTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.BitableRecordTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.BitableListTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.BatchCreateAppTableRecordTool{MCP: feishuMCP})
 
 		// Wiki tools
-		agentLoop.RegisterTool(&feishu_mcp.WikiListSpacesTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.WikiListNodesTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.WikiGetNodeTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.WikiMoveNodeTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.WikiCreateNodeTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.WikiListSpacesTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.WikiListNodesTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.WikiGetNodeTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.WikiMoveNodeTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.WikiCreateNodeTool{MCP: feishuMCP})
 
 		// Document tools
-		agentLoop.RegisterTool(&feishu_mcp.DocxGetContentTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.DocxListBlocksTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.DocxCreateTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.DocxInsertBlockTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.DocxGetBlockTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.DocxDeleteBlocksTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.DocxFindBlockTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.DocxGetContentTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.DocxListBlocksTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.DocxCreateTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.DocxInsertBlockTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.DocxGetBlockTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.DocxDeleteBlocksTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.DocxFindBlockTool{MCP: feishuMCP})
 
 		// Search tools
-		agentLoop.RegisterTool(&feishu_mcp.SearchWikiTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.SearchWikiTool{MCP: feishuMCP})
 
 		// Drive tools
-		agentLoop.RegisterTool(&feishu_mcp.UploadFileTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.ListFilesTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.AddPermissionTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.UploadFileTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.ListFilesTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.AddPermissionTool{MCP: feishuMCP})
 
 		// Message resource tools
-		agentLoop.RegisterTool(&feishu_mcp.DownloadFileTool{MCP: feishuMCP})
-		agentLoop.RegisterTool(&feishu_mcp.SendFileTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.DownloadFileTool{MCP: feishuMCP})
+		backend.RegisterTool(&feishu_mcp.SendFileTool{MCP: feishuMCP})
 
 		log.Info("OAuth and Feishu MCP tools registered")
 	}
 
 	// 注册 DownloadFile 工具（支持 Web/OSS 和飞书两种来源）
-	agentLoop.RegisterCoreTool(tools.NewDownloadFileTool(cfg.Feishu.AppID, cfg.Feishu.AppSecret))
-	agentLoop.RegisterTool(tools.NewDownloadFileTool(cfg.Feishu.AppID, cfg.Feishu.AppSecret))
-	agentLoop.RegisterCoreTool(tools.NewWebSearchTool(cfg.TavilyAPIKey))
+	backend.RegisterCoreTool(tools.NewDownloadFileTool(cfg.Feishu.AppID, cfg.Feishu.AppSecret))
+	backend.RegisterTool(tools.NewDownloadFileTool(cfg.Feishu.AppID, cfg.Feishu.AppSecret))
+	backend.RegisterCoreTool(tools.NewWebSearchTool(cfg.TavilyAPIKey))
 
 	// 注册 Logs 工具（仅管理员可用）
 	adminChatID := cfg.Admin.ChatID
 	if adminChatID != "" {
 		logsTool := tools.NewLogsTool(adminChatID)
-		agentLoop.RegisterCoreTool(logsTool)
+		backend.RegisterCoreTool(logsTool)
 		log.WithField("admin_chat_id", adminChatID).Info("Logs tool registered (admin only)")
 	}
 
 	// 初始化事件触发系统（Event Trigger System）
-	triggerSvc := sqlite.NewTriggerService(agentLoop.MultiSession().DB())
+	triggerSvc := sqlite.NewTriggerService(backend.MultiSession().DB())
 	eventRouter := event.NewRouter(triggerSvc)
-	agentLoop.SetEventRouter(eventRouter)
+	backend.SetEventRouter(eventRouter)
 
 	webhookBaseURL := cfg.EventWebhook.BaseURL
 	if webhookBaseURL == "" {
 		webhookBaseURL = fmt.Sprintf("http://%s:%d", cfg.EventWebhook.Host, cfg.EventWebhook.Port)
 	}
-	agentLoop.RegisterCoreTool(tools.NewEventTriggerTool(eventRouter, webhookBaseURL))
+	backend.RegisterCoreTool(tools.NewEventTriggerTool(eventRouter, webhookBaseURL))
 
 	var webhookServer *event.WebhookServer
 	if cfg.EventWebhook.Enable {
@@ -576,8 +1126,8 @@ func main() {
 	}
 
 	// 所有工具注册完成，索引全局工具（用于 search_tools 语义搜索）
-	agentLoop.IndexGlobalTools()
-	agentLoop.LLMFactory().SetModelTiers(cfg.LLM)
+	backend.IndexGlobalTools()
+	backend.LLMFactory().SetModelTiers(cfg.LLM)
 
 	tokenDB, err := sqlite.Open(dbPath)
 	if err != nil {
@@ -592,18 +1142,18 @@ func main() {
 	if tokenDB != nil {
 		webDB = tokenDB.Conn()
 	}
-	feishuCh, err := registerChannels(disp, cfg, msgBus, agentLoop, webDB, workDir)
+	feishuCh, err := registerChannels(disp, cfg, msgBus, backend, webDB, workDir)
 	if err != nil {
 		log.WithError(err).Fatal("Failed to register channels")
 	}
 
-	agentLoop.SetDirectSend(disp.SendDirect)
-	agentLoop.SetChannelFinder(disp.GetChannel)
+	backend.SetDirectSend(disp.SendDirect)
+	backend.SetChannelFinder(disp.GetChannel)
 
 	// 设置飞书渠道的 CardBuilder（用于卡片回调处理）
 	if feishuCh != nil {
-		feishuCh.SetCardBuilder(agentLoop.GetCardBuilder())
-		if hook := agentLoop.ToolHookChain().Get("approval"); hook != nil {
+		feishuCh.SetCardBuilder(backend.GetCardBuilder())
+		if hook := backend.ToolHookChain().Get("approval"); hook != nil {
 			if ah, ok := hook.(*tools.ApprovalHook); ok {
 				feishuCh.SetApprovalHook(ah)
 			}
@@ -620,29 +1170,29 @@ func main() {
 		// 注入设置卡片回调（让飞书渠道能访问 Agent 的 LLM/Registry/Settings 功能）
 		feishuCh.SetSettingsCallbacks(channel.SettingsCallbacks{
 			LLMList: func(senderID string) ([]string, string) {
-				llmClient, currentModel, _, _ := agentLoop.LLMFactory().GetLLM(senderID)
+				llmClient, currentModel, _, _ := backend.LLMFactory().GetLLM(senderID)
 				return llmClient.ListModels(), currentModel
 			},
 			LLMSet: func(senderID, model string) error {
-				return agentLoop.SetUserModel(senderID, model)
+				return backend.SetUserModel(senderID, model)
 			},
 			LLMGetMaxContext: func(senderID string) int {
-				return agentLoop.GetUserMaxContext(senderID)
+				return backend.GetUserMaxContext(senderID)
 			},
 			LLMSetMaxContext: func(senderID string, maxContext int) error {
-				return agentLoop.SetUserMaxContext(senderID, maxContext)
+				return backend.SetUserMaxContext(senderID, maxContext)
 			},
 			LLMGetMaxOutputTokens: func(senderID string) int {
-				return agentLoop.GetUserMaxOutputTokens(senderID)
+				return backend.GetUserMaxOutputTokens(senderID)
 			},
 			LLMSetMaxOutputTokens: func(senderID string, maxTokens int) error {
-				return agentLoop.SetUserMaxOutputTokens(senderID, maxTokens)
+				return backend.SetUserMaxOutputTokens(senderID, maxTokens)
 			},
 			LLMGetThinkingMode: func(senderID string) string {
-				return agentLoop.GetUserThinkingMode(senderID)
+				return backend.GetUserThinkingMode(senderID)
 			},
 			LLMSetThinkingMode: func(senderID string, mode string) error {
-				return agentLoop.SetUserThinkingMode(senderID, mode)
+				return backend.SetUserThinkingMode(senderID, mode)
 			},
 			LLMGetModelTier: func(tier string) string {
 				switch tier {
@@ -667,14 +1217,14 @@ func main() {
 				default:
 					return fmt.Errorf("unknown tier: %s", tier)
 				}
-				agentLoop.LLMFactory().SetModelTiers(cfg.LLM)
+				backend.LLMFactory().SetModelTiers(cfg.LLM)
 				return config.SaveToFile(config.ConfigFilePath(), cfg)
 			},
 			LLMListAllModels: func() []string {
-				return agentLoop.LLMFactory().ListAllModelsForUser("")
+				return backend.LLMFactory().ListAllModelsForUser("")
 			},
 			LLMListSubscriptions: func(senderID string) ([]channel.Subscription, error) {
-				subs, err := agentLoop.LLMFactory().GetSubscriptionSvc().List(senderID)
+				subs, err := backend.LLMFactory().GetSubscriptionSvc().List(senderID)
 				if err != nil {
 					return nil, err
 				}
@@ -693,7 +1243,7 @@ func main() {
 				return result, nil
 			},
 			LLMGetDefaultSubscription: func(senderID string) (*channel.Subscription, error) {
-				sub, err := agentLoop.LLMFactory().GetSubscriptionSvc().GetDefault(senderID)
+				sub, err := backend.LLMFactory().GetSubscriptionSvc().GetDefault(senderID)
 				if err != nil || sub == nil {
 					return nil, err
 				}
@@ -708,7 +1258,7 @@ func main() {
 				}, nil
 			},
 			LLMAddSubscription: func(senderID string, sub *channel.Subscription) error {
-				svc := agentLoop.LLMFactory().GetSubscriptionSvc()
+				svc := backend.LLMFactory().GetSubscriptionSvc()
 				err := svc.Add(&sqlite.LLMSubscription{
 					SenderID: senderID,
 					Name:     sub.Name,
@@ -718,12 +1268,12 @@ func main() {
 					Model:    sub.Model,
 				})
 				if err == nil {
-					agentLoop.LLMFactory().Invalidate(senderID)
+					backend.LLMFactory().Invalidate(senderID)
 				}
 				return err
 			},
 			LLMRemoveSubscription: func(id string) error {
-				svc := agentLoop.LLMFactory().GetSubscriptionSvc()
+				svc := backend.LLMFactory().GetSubscriptionSvc()
 				// Get senderID before removing for cache invalidation
 				sub, err := svc.Get(id)
 				if err != nil {
@@ -732,11 +1282,11 @@ func main() {
 				if err := svc.Remove(id); err != nil {
 					return err
 				}
-				agentLoop.LLMFactory().Invalidate(sub.SenderID)
+				backend.LLMFactory().Invalidate(sub.SenderID)
 				return nil
 			},
 			LLMSetDefaultSubscription: func(id string) error {
-				svc := agentLoop.LLMFactory().GetSubscriptionSvc()
+				svc := backend.LLMFactory().GetSubscriptionSvc()
 				if err := svc.SetDefault(id); err != nil {
 					return err
 				}
@@ -744,36 +1294,36 @@ func main() {
 				// picks up the new default on next request.
 				sub, err := svc.Get(id)
 				if err == nil && sub != nil {
-					agentLoop.LLMFactory().Invalidate(sub.SenderID)
+					backend.LLMFactory().Invalidate(sub.SenderID)
 				}
 				return nil
 			},
 			LLMRenameSubscription: func(id, name string) error {
-				return agentLoop.LLMFactory().GetSubscriptionSvc().Rename(id, name)
+				return backend.LLMFactory().GetSubscriptionSvc().Rename(id, name)
 			},
 			ContextModeGet: func() string {
-				return agentLoop.GetContextMode()
+				return backend.GetContextMode()
 			},
 			ContextModeSet: func(mode string) error {
-				return agentLoop.SetContextMode(mode)
+				return backend.SetContextMode(mode)
 			},
 			RegistryBrowse: func(entryType string, limit, offset int) ([]sqlite.SharedEntry, error) {
-				return agentLoop.RegistryManager().Browse(entryType, limit, offset)
+				return backend.RegistryManager().Browse(entryType, limit, offset)
 			},
 			RegistryInstall: func(entryType string, id int64, senderID string) error {
-				return agentLoop.RegistryManager().Install(entryType, id, senderID)
+				return backend.RegistryManager().Install(entryType, id, senderID)
 			},
 			RegistryListMy: func(senderID, entryType string) ([]sqlite.SharedEntry, []string, error) {
-				return agentLoop.RegistryManager().ListMy(senderID, entryType)
+				return backend.RegistryManager().ListMy(senderID, entryType)
 			},
 			RegistryPublish: func(entryType, name, senderID string) error {
-				return agentLoop.RegistryManager().Publish(entryType, name, senderID)
+				return backend.RegistryManager().Publish(entryType, name, senderID)
 			},
 			RegistryUnpublish: func(entryType, name, senderID string) error {
-				return agentLoop.RegistryManager().Unpublish(entryType, name, senderID)
+				return backend.RegistryManager().Unpublish(entryType, name, senderID)
 			},
 			RegistryDelete: func(entryType, name, senderID string) error {
-				return agentLoop.RegistryManager().Uninstall(entryType, name, senderID)
+				return backend.RegistryManager().Uninstall(entryType, name, senderID)
 			},
 			MetricsGet: func() string {
 				return agent.GlobalMetrics.Snapshot().FormatMarkdown()
@@ -787,10 +1337,10 @@ func main() {
 				return sb.IsExporting(senderID)
 			},
 			LLMGetPersonalConcurrency: func(senderID string) int {
-				return agentLoop.GetLLMConcurrency(senderID)
+				return backend.GetLLMConcurrency(senderID)
 			},
 			LLMSetPersonalConcurrency: func(senderID string, personal int) error {
-				return agentLoop.SetLLMConcurrency(senderID, personal)
+				return backend.SetLLMConcurrency(senderID, personal)
 			},
 			RunnerConnectCmdGet: func(senderID string) string {
 				token := cfg.Sandbox.AuthToken
@@ -948,15 +1498,15 @@ func main() {
 			},
 			// ── 记忆管理（危险区） ──
 			MemoryClear: func(senderID, chatID, targetType string) error {
-				return agentLoop.MultiSession().ClearMemory(context.Background(), "feishu", chatID, targetType, senderID)
+				return backend.MultiSession().ClearMemory(context.Background(), "feishu", chatID, targetType, senderID)
 			},
 			MemoryGetStats: func(senderID, chatID string) map[string]string {
-				return agentLoop.MultiSession().GetMemoryStats(context.Background(), "feishu", chatID, senderID)
+				return backend.MultiSession().GetMemoryStats(context.Background(), "feishu", chatID, senderID)
 			},
 		})
 
 		// 注入飞书渠道特化 prompt 提供者
-		agentLoop.SetChannelPromptProviders(&feishuPromptAdapter{ch: feishuCh})
+		backend.SetChannelPromptProviders(&feishuPromptAdapter{ch: feishuCh})
 	}
 
 	// 设置优雅退出（提前声明 ctx，供 OAuth Manager cleanup goroutine 使用）
@@ -1050,7 +1600,7 @@ func main() {
 				sigCh <- syscall.SIGTERM
 			}
 		}()
-		if err := agentLoop.Run(ctx); err != nil && ctx.Err() == nil {
+		if err := backend.Run(ctx); err != nil && ctx.Err() == nil {
 			log.WithError(err).Error("Agent loop exited with error")
 		}
 	}()
@@ -1077,8 +1627,8 @@ func main() {
 	}
 
 	// 等待 agent loop 退出后再继续关闭
-	if agentLoop != nil {
-		agentLoop.Close()
+	if backend != nil {
+		backend.Close()
 	}
 
 	// 关闭沙箱（清理 Docker 容器等资源）

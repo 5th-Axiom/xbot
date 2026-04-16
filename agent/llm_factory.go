@@ -5,17 +5,20 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"xbot/config"
 	"xbot/llm"
+	log "xbot/logger"
 	"xbot/storage/sqlite"
 )
 
 // LLMFactory 管理用户自定义 LLM 客户端的创建和缓存
 type LLMFactory struct {
 	configSvc           *sqlite.UserLLMConfigService
-	subscriptionSvc     *sqlite.LLMSubscriptionService // 多订阅管理
-	settingsSvc         *SettingsService               // 用于读写用户并发配置
+	subscriptionSvc     *sqlite.LLMSubscriptionService     // 多订阅管理 (DB-backed)
+	configSubsFn        func() []config.SubscriptionConfig // CLI config.json subscriptions (non-DB)
+	settingsSvc         *SettingsService                   // 用于读写用户并发配置
 	defaultLLM          llm.LLM
 	defaultModel        string
 	defaultThinkingMode string
@@ -163,6 +166,14 @@ func (f *LLMFactory) SetSubscriptionSvc(svc *sqlite.LLMSubscriptionService) {
 	f.subscriptionSvc = svc
 }
 
+// SetConfigSubs sets a function that returns CLI config.json subscriptions (used when DB subscriptions are empty).
+// Using a function instead of a slice ensures we always read the latest subscriptions after Add/Remove/Update.
+func (f *LLMFactory) SetConfigSubs(fn func() []config.SubscriptionConfig) {
+	f.mu.Lock()
+	f.configSubsFn = fn
+	f.mu.Unlock()
+}
+
 // GetSubscriptionSvc returns the subscription service.
 func (f *LLMFactory) GetSubscriptionSvc() *sqlite.LLMSubscriptionService {
 	return f.subscriptionSvc
@@ -287,10 +298,12 @@ func (f *LLMFactory) createClient(cfg *sqlite.UserLLMConfig) (llm.LLM, string) {
 		// 其他所有 provider（openai, deepseek, siliconflow 等）都使用 OpenAI 兼容 API
 		maxTokens := cfg.MaxOutputTokens
 		client := llm.NewOpenAILLM(llm.OpenAIConfig{
-			BaseURL:      cfg.BaseURL,
-			APIKey:       cfg.APIKey,
-			DefaultModel: model,
-			MaxTokens:    maxTokens,
+			BaseURL:        cfg.BaseURL,
+			APIKey:         cfg.APIKey,
+			DefaultModel:   model,
+			MaxTokens:      maxTokens,
+			OnModelsLoaded: cfg.OnModelsLoaded,
+			SubscriptionID: cfg.ID,
 		})
 		return client, model
 	}
@@ -475,58 +488,174 @@ func (f *LLMFactory) GetMaxOutputTokens(senderID string) int {
 func (f *LLMFactory) GetLLMForModel(senderID, targetModel string) (llm.LLM, string, int, string, bool) {
 	resolvedModel, _ := f.resolveTierModel(targetModel)
 	if resolvedModel == "" {
-		// 无指定模型 → 使用默认
 		client, model, maxCtx, tm := f.GetLLM(senderID)
 		return client, model, maxCtx, tm, false
 	}
 
-	// Tier resolved or explicit model name specified — try subscription matching first
-	if f.subscriptionSvc != nil {
+	// Step 1: look up from cached model lists in DB — O(1), no API calls
+	modelMap := f.buildModelSubscriptionMap(senderID)
+	if sub, ok := modelMap[resolvedModel]; ok {
+		log.WithFields(log.Fields{"model": resolvedModel, "sub": sub.Name, "step": 1}).Info("[LLM] GetLLMForModel: cache hit")
+		client := f.createClientFromSub(sub, resolvedModel)
+		if client != nil {
+			return client, resolvedModel, sub.MaxContext, sub.ThinkingMode, true
+		}
+	} else {
+		log.WithField("model", resolvedModel).Info("[LLM] GetLLMForModel: cache miss, trying subscriptions")
+	}
+
+	// Step 2: cache miss — try each subscription.
+	// First try config.json subscriptions (CLI mode), then DB subscriptions.
+	// Config subs match on Model field only (no CachedModels).
+	f.mu.RLock()
+	getConfigSubs := f.configSubsFn
+	f.mu.RUnlock()
+	var configSubs []config.SubscriptionConfig
+	if getConfigSubs != nil {
+		configSubs = getConfigSubs()
+	}
+	for _, cs := range configSubs {
+		if cs.BaseURL == "" || cs.APIKey == "" {
+			continue
+		}
+		if cs.Model == resolvedModel {
+			sub := configSubToLLMSubscription(cs)
+			client := f.createClientFromSub(sub, resolvedModel)
+			if client != nil {
+				log.WithFields(log.Fields{"model": resolvedModel, "sub": cs.Name, "step": 2, "source": "config"}).Info("[LLM] GetLLMForModel: found in config sub")
+				return client, resolvedModel, sub.MaxContext, sub.ThinkingMode, true
+			}
+		}
+	}
+
+	// DB subscriptions (same logic as before)
+	if f.subscriptionSvc != nil && senderID != "" {
 		subs, err := f.subscriptionSvc.List(senderID)
 		if err == nil && len(subs) > 0 {
-			// 1. 精确匹配：订阅的 Model 字段 == resolvedModel
 			for _, sub := range subs {
-				if sub.Model == resolvedModel {
+				if sub.BaseURL == "" || sub.APIKey == "" {
+					continue
+				}
+				// Check DB cache first (O(1) per sub, no API call)
+				found := false
+				for _, m := range sub.CachedModels {
+					if m == resolvedModel {
+						found = true
+						break
+					}
+				}
+				if !found && sub.Model == resolvedModel {
+					found = true
+				}
+				if found {
 					client := f.createClientFromSub(sub, resolvedModel)
 					if client != nil {
+						log.WithFields(log.Fields{"model": resolvedModel, "sub": sub.Name, "step": 2}).Info("[LLM] GetLLMForModel: found in sub cache")
 						return client, resolvedModel, sub.MaxContext, sub.ThinkingMode, true
 					}
 				}
-			}
-
-			// 2. 使用活跃订阅的凭证 + resolvedModel
-			activeSub, err := f.subscriptionSvc.GetDefault(senderID)
-			if err == nil && activeSub != nil {
-				client := f.createClientFromSub(activeSub, resolvedModel)
-				if client != nil {
-					return client, resolvedModel, activeSub.MaxContext, activeSub.ThinkingMode, true
-				}
-			}
-
-			// 3. Provider 匹配：找 provider 能服务该模型的订阅
-			provider := guessProvider(resolvedModel)
-			for _, sub := range subs {
-				if provider != "" && sub.Provider == provider {
+				// No cache — try loading from API (first-run for this subscription)
+				if len(sub.CachedModels) == 0 {
 					client := f.createClientFromSub(sub, resolvedModel)
-					if client != nil {
-						return client, resolvedModel, sub.MaxContext, sub.ThinkingMode, true
+					if client == nil {
+						continue
 					}
-				}
-			}
-
-			// 4. 任意可用订阅
-			for _, sub := range subs {
-				client := f.createClientFromSub(sub, resolvedModel)
-				if client != nil {
-					return client, resolvedModel, sub.MaxContext, sub.ThinkingMode, true
+					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					if loader, ok := client.(llm.ModelLoader); ok {
+						_ = loader.LoadModelsFromAPI(ctx)
+					}
+					cancel()
+					// OnModelsLoaded callback updated DB — re-read sub to get fresh cache
+					updatedSubs, err2 := f.subscriptionSvc.List(senderID)
+					if err2 == nil {
+						for _, us := range updatedSubs {
+							if us.ID == sub.ID {
+								for _, m := range us.CachedModels {
+									if m == resolvedModel {
+										log.WithFields(log.Fields{"model": resolvedModel, "sub": sub.Name, "step": 2}).Info("[LLM] GetLLMForModel: found after API load")
+										return client, resolvedModel, sub.MaxContext, sub.ThinkingMode, true
+									}
+								}
+							}
+						}
+					}
 				}
 			}
 		}
 	}
 
-	// Fallback: use default client with resolved model name (works for CLI mode without subscriptions)
-	client, _, maxCtx, tm := f.GetLLM(senderID)
-	return client, resolvedModel, maxCtx, tm, true
+	// Fallback: model not found in any subscription — use default client with its OWN model
+	// (not resolvedModel, to avoid sending wrong model to wrong endpoint).
+	log.WithFields(log.Fields{"model": resolvedModel, "fallback": true}).Warn("[LLM] GetLLMForModel: model not found in any subscription, using default")
+	client, defaultModel, maxCtx, tm := f.GetLLM(senderID)
+	return client, defaultModel, maxCtx, tm, false
+}
+
+// buildModelSubscriptionMap builds a model_name → subscription lookup table from
+// cached model lists in DB and config.json subscriptions. No API calls.
+// Each subscription's active model (sub.Model) is always included.
+// Config subs are checked first (CLI mode), then DB subs (server mode).
+func (f *LLMFactory) buildModelSubscriptionMap(senderID string) map[string]*sqlite.LLMSubscription {
+	m := make(map[string]*sqlite.LLMSubscription)
+
+	// First: config.json subscriptions (CLI mode)
+	f.mu.RLock()
+	getConfigSubs := f.configSubsFn
+	f.mu.RUnlock()
+	var configSubs []config.SubscriptionConfig
+	if getConfigSubs != nil {
+		configSubs = getConfigSubs()
+	}
+	for _, cs := range configSubs {
+		if cs.BaseURL == "" || cs.APIKey == "" {
+			continue
+		}
+		sub := configSubToLLMSubscription(cs)
+		if sub.Model != "" {
+			if _, exists := m[sub.Model]; !exists {
+				m[sub.Model] = sub
+			}
+		}
+		// Config subs don't have CachedModels — only Model field is available
+	}
+
+	// Second: DB subscriptions (server mode)
+	if f.subscriptionSvc != nil && senderID != "" {
+		subs, err := f.subscriptionSvc.List(senderID)
+		if err == nil && len(subs) > 0 {
+			for _, sub := range subs {
+				if sub.BaseURL == "" || sub.APIKey == "" {
+					continue
+				}
+				for _, modelName := range sub.CachedModels {
+					if _, exists := m[modelName]; !exists {
+						m[modelName] = sub
+					}
+				}
+				if sub.Model != "" {
+					if _, exists := m[sub.Model]; !exists {
+						m[sub.Model] = sub
+					}
+				}
+			}
+		}
+	}
+	return m
+}
+
+// configSubToLLMSubscription converts a config.SubscriptionConfig to sqlite.LLMSubscription
+// for use in buildModelSubscriptionMap.
+func configSubToLLMSubscription(cs config.SubscriptionConfig) *sqlite.LLMSubscription {
+	return &sqlite.LLMSubscription{
+		ID:              cs.ID,
+		Name:            cs.Name,
+		Provider:        cs.Provider,
+		BaseURL:         cs.BaseURL,
+		APIKey:          cs.APIKey,
+		Model:           cs.Model,
+		MaxOutputTokens: cs.MaxOutputTokens,
+		ThinkingMode:    cs.ThinkingMode,
+	}
 }
 
 // createClientFromSub 从订阅创建 LLM 客户端，使用指定的模型名（而非订阅的默认模型）
@@ -540,6 +669,13 @@ func (f *LLMFactory) createClientFromSub(sub *sqlite.LLMSubscription, model stri
 		APIKey:          sub.APIKey,
 		Model:           model,
 		MaxOutputTokens: sub.MaxOutputTokens,
+		OnModelsLoaded: func(models []string) {
+			if f.subscriptionSvc != nil && sub.ID != "" {
+				if err := f.subscriptionSvc.UpdateCachedModels(sub.ID, models); err != nil {
+					log.WithError(err).WithField("sub_id", sub.ID).Debug("failed to cache subscription models (may be config-only sub)")
+				}
+			}
+		},
 	}
 	client, _ := f.createClient(cfg)
 	return client
@@ -568,21 +704,39 @@ func (f *LLMFactory) resolveTierModel(value string) (string, bool) {
 	tiers := f.tierModels
 	f.mu.RUnlock()
 
+	// Try requested tier first
+	model := f.tierModel(tiers, tier)
+	if model != "" {
+		return model, true
+	}
+	// Fallback chain: swift/vanguard → balance → vanguard/swift
+	fallback := ""
 	switch tier {
-	case "vanguard":
-		if strings.TrimSpace(tiers.VanguardModel) != "" {
-			return strings.TrimSpace(tiers.VanguardModel), true
-		}
+	case "swift", "vanguard":
+		fallback = "balance"
 	case "balance":
-		if strings.TrimSpace(tiers.BalanceModel) != "" {
-			return strings.TrimSpace(tiers.BalanceModel), true
-		}
-	case "swift":
-		if strings.TrimSpace(tiers.SwiftModel) != "" {
-			return strings.TrimSpace(tiers.SwiftModel), true
+		fallback = "vanguard"
+	}
+	if fallback != "" {
+		if model = f.tierModel(tiers, fallback); model != "" {
+			return model, true
 		}
 	}
+	// All tiers unconfigured — let caller fall through to default LLM
 	return "", true
+}
+
+// tierModel returns the trimmed model name for a tier, or "" if unconfigured.
+func (f *LLMFactory) tierModel(tiers config.LLMConfig, tier string) string {
+	switch tier {
+	case "vanguard":
+		return strings.TrimSpace(tiers.VanguardModel)
+	case "balance":
+		return strings.TrimSpace(tiers.BalanceModel)
+	case "swift":
+		return strings.TrimSpace(tiers.SwiftModel)
+	}
+	return ""
 }
 
 // guessProvider 根据模型名猜测 provider。

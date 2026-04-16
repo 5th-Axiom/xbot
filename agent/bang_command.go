@@ -15,7 +15,7 @@ import (
 
 const (
 	// bangOutputMaxLen is the max character count before output is sent as a file.
-	bangOutputMaxLen = 4000
+	bangOutputMaxLen = 16000
 	// bangDefaultTimeout is the default execution timeout for bang commands.
 	bangDefaultTimeout = 120 * time.Second
 )
@@ -65,17 +65,23 @@ func (a *Agent) handleBangCommand(ctx context.Context, msg bus.InboundMessage, c
 	// Format result
 	content := formatBangOutput(command, output, exitErr)
 
-	// If output is too long, write to a .md file and send as file link
-	if len([]rune(content)) > bangOutputMaxLen {
-		filePath, err := a.writeBangOutputFile(ctx, workspaceRoot, command, output, exitErr, sbUID)
-		if err != nil {
-			log.WithError(err).Warn("Failed to write bang output file, sending truncated")
-			// Truncate and send inline
-			runes := []rune(content)
-			content = string(runes[:bangOutputMaxLen-100]) + "\n...\n(output truncated, full output write failed)"
+	// If output is too long, handle based on channel:
+	// - Feishu: write to a .md file and send as file link (feishu renders markdown file links as downloadable cards)
+	// - Other channels (CLI, Web, etc.): truncate inline (file links are meaningless)
+	runes := []rune(content)
+	if len(runes) > bangOutputMaxLen {
+		if msg.Channel == "feishu" {
+			filePath, err := a.writeBangOutputFile(ctx, workspaceRoot, command, output, exitErr, sbUID)
+			if err != nil {
+				log.WithError(err).Warn("Failed to write bang output file, sending truncated")
+				content = string(runes[:bangOutputMaxLen-100]) + "\n...\n(output truncated, full output write failed)"
+			} else {
+				fileName := filepath.Base(filePath)
+				content = fmt.Sprintf("[%s](%s)", fileName, filePath)
+			}
 		} else {
-			fileName := filepath.Base(filePath)
-			content = fmt.Sprintf("[%s](%s)", fileName, filePath)
+			// Non-feishu channels: truncate inline
+			content = string(runes[:bangOutputMaxLen-100]) + "\n...\n(output truncated)"
 		}
 	}
 

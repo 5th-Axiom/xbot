@@ -397,7 +397,7 @@ func localeZH() *UILocale {
 			},
 			{
 				Key: "llm_api_key", Label: "API Key", Description: "LLM 服务的 API Key（必填）",
-				Type: SettingTypeText, Category: "LLM",
+				Type: SettingTypePassword, Category: "LLM",
 			},
 			{
 				Key: "llm_base_url", Label: "Base URL", Description: "LLM API 地址",
@@ -409,7 +409,7 @@ func localeZH() *UILocale {
 			},
 			{
 				Key: "tavily_api_key", Label: "Tavily API Key", Description: "网络搜索服务密钥（可选，留空则无法使用 WebSearch）",
-				Type: SettingTypeText, Category: "LLM",
+				Type: SettingTypePassword, Category: "LLM",
 			},
 			{
 				Key: "sandbox_mode", Label: "沙箱模式", Description: "命令执行隔离方式",
@@ -454,7 +454,7 @@ func localeZH() *UILocale {
 			},
 			{
 				Key: "llm_api_key", Label: "API Key", Description: "LLM 服务的 API Key",
-				Type: SettingTypeText, Category: "LLM",
+				Type: SettingTypePassword, Category: "LLM",
 			},
 			{
 				Key: "llm_model", Label: "LLM 模型", Description: "选择或输入 LLM 模型名称",
@@ -522,8 +522,8 @@ func localeZH() *UILocale {
 				},
 			},
 			{
-				Key: "enable_stream", Label: "流式输出", Description: "使用流式 API 调用 LLM，兼容 Copilot 等代理（默认关闭）",
-				Type: SettingTypeSelect, Category: "Agent", DefaultValue: "false",
+				Key: "enable_stream", Label: "流式输出", Description: "使用流式 API 调用 LLM（默认开启）",
+				Type: SettingTypeSelect, Category: "Agent", DefaultValue: "true",
 				Options: []SettingOption{
 					{Label: "开启", Value: "true"},
 					{Label: "关闭", Value: "false"},
@@ -782,7 +782,7 @@ func localeEN() *UILocale {
 			},
 			{
 				Key: "llm_api_key", Label: "API Key", Description: "API key for LLM service (required)",
-				Type: SettingTypeText, Category: "LLM",
+				Type: SettingTypePassword, Category: "LLM",
 			},
 			{
 				Key: "llm_base_url", Label: "Base URL", Description: "LLM API endpoint",
@@ -794,7 +794,7 @@ func localeEN() *UILocale {
 			},
 			{
 				Key: "tavily_api_key", Label: "Tavily API Key", Description: "Web search service key (optional, leave empty to disable WebSearch)",
-				Type: SettingTypeText, Category: "LLM",
+				Type: SettingTypePassword, Category: "LLM",
 			},
 			{
 				Key: "sandbox_mode", Label: "Sandbox Mode", Description: "Command execution isolation method",
@@ -839,7 +839,7 @@ func localeEN() *UILocale {
 			},
 			{
 				Key: "llm_api_key", Label: "API Key", Description: "LLM service API Key",
-				Type: SettingTypeText, Category: "LLM",
+				Type: SettingTypePassword, Category: "LLM",
 			},
 			{
 				Key: "llm_model", Label: "LLM Model", Description: "Select or enter LLM model name",
@@ -907,8 +907,8 @@ func localeEN() *UILocale {
 				},
 			},
 			{
-				Key: "enable_stream", Label: "Stream Output", Description: "Use streaming API for LLM calls, compatible with Copilot proxies (off by default)",
-				Type: SettingTypeSelect, Category: "Agent", DefaultValue: "false",
+				Key: "enable_stream", Label: "Stream Output", Description: "Use streaming API for LLM calls (on by default)",
+				Type: SettingTypeSelect, Category: "Agent", DefaultValue: "true",
 				Options: []SettingOption{
 					{Label: "On", Value: "true"},
 					{Label: "Off", Value: "false"},
@@ -1167,7 +1167,7 @@ func localeJA() *UILocale {
 			},
 			{
 				Key: "llm_api_key", Label: "API Key", Description: "LLM サービスの API Key（必須）",
-				Type: SettingTypeText, Category: "LLM",
+				Type: SettingTypePassword, Category: "LLM",
 			},
 			{
 				Key: "llm_base_url", Label: "Base URL", Description: "LLM API エンドポイント",
@@ -1179,7 +1179,7 @@ func localeJA() *UILocale {
 			},
 			{
 				Key: "tavily_api_key", Label: "Tavily API Key", Description: "Web検索サービスキー（オプション、空の場合 WebSearch は無効）",
-				Type: SettingTypeText, Category: "LLM",
+				Type: SettingTypePassword, Category: "LLM",
 			},
 			{
 				Key: "sandbox_mode", Label: "サンドボックスモード", Description: "コマンド実行の分離方法",
@@ -1224,7 +1224,7 @@ func localeJA() *UILocale {
 			},
 			{
 				Key: "llm_api_key", Label: "API Key", Description: "LLM サービスの API Key",
-				Type: SettingTypeText, Category: "LLM",
+				Type: SettingTypePassword, Category: "LLM",
 			},
 			{
 				Key: "llm_model", Label: "LLM モデル", Description: "LLM モデル名を選択または入力",
@@ -1292,8 +1292,8 @@ func localeJA() *UILocale {
 				},
 			},
 			{
-				Key: "enable_stream", Label: "ストリーム出力", Description: "ストリーミング API で LLM を呼び出し、Copilot プロキシ等と互換（デフォルト: オフ）",
-				Type: SettingTypeSelect, Category: "Agent", DefaultValue: "false",
+				Key: "enable_stream", Label: "ストリーム出力", Description: "ストリーミング API で LLM を呼び出し（デフォルト: オン）",
+				Type: SettingTypeSelect, Category: "Agent", DefaultValue: "true",
 				Options: []SettingOption{
 					{Label: "オン", Value: "true"},
 					{Label: "オフ", Value: "false"},

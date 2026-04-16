@@ -502,8 +502,11 @@ type CLIChannel struct {
 	approvalHook *tools.ApprovalHook // injected to wire CLIApprovalHandler after program creation
 
 	// Pending injections (set before model exists, applied in Start)
-	pendingTrimHistoryFn  func(time.Time) error
-	pendingCheckpointHook *tools.CheckpointHook
+	pendingTrimHistoryFn     func(time.Time) error
+	pendingResetTokenStateFn func()
+	pendingHistory           []HistoryMessage // remote mode: cached history before model is ready
+	pendingCheckpointHook    *tools.CheckpointHook
+	pendingSendInboundFn     func(bus.InboundMessage) bool // remote mode: forward to server
 }
 
 // SettingsService is the interface needed by CLIChannel for settings panel.
@@ -539,6 +542,7 @@ type SubscriptionManager interface {
 	SetDefault(id string) error
 	SetModel(id, model string) error
 	Rename(id, name string) error
+	Update(id string, sub *Subscription) error
 }
 
 // LLMSubscriber switches the active LLM for a user (called when subscription changes).

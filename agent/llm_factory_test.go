@@ -57,13 +57,14 @@ func TestGetLLMForModel_NilSubscriptionSvc(t *testing.T) {
 	f := NewLLMFactory(nil, nil, "default-model")
 	f.defaultThinkingMode = "auto"
 
-	// No subscriptionSvc but explicit model → fallback to default client with target model name
+	// No subscriptionSvc + explicit model → model not found in any subscription,
+	// fallback to default client with its OWN model (not the target model).
 	_, model, _, _, usedCustom := f.GetLLMForModel("user1", "claude-opus-4-20250115")
-	if model != "claude-opus-4-20250115" {
-		t.Errorf("model = %q, want claude-opus-4-20250115 (fallback uses target model name)", model)
+	if model != "default-model" {
+		t.Errorf("model = %q, want default-model (fallback uses default client's model)", model)
 	}
-	if !usedCustom {
-		t.Error("usedCustom should be true when target model is specified")
+	if usedCustom {
+		t.Error("usedCustom should be false when model not found in any subscription")
 	}
 }
 
@@ -171,8 +172,9 @@ func TestResolveTierModel(t *testing.T) {
 	if !usedTier {
 		t.Error("usedTier should be true even for unconfigured tier")
 	}
-	if model != "" {
-		t.Errorf("model = %q, want empty for unconfigured tier", model)
+	// balance unconfigured → fallback to vanguard
+	if model != "opus" {
+		t.Errorf("model = %q, want opus (fallback from unconfigured balance to vanguard)", model)
 	}
 }
 
@@ -180,26 +182,75 @@ func TestGetLLMForModel_TierResolution(t *testing.T) {
 	f := NewLLMFactory(nil, nil, "default-model")
 	f.defaultThinkingMode = "auto"
 
-	// Tier with no subscriptionSvc → fallback to default client with resolved model name
+	// Tier with no subscriptionSvc → model not found, fallback to default client
 	f.SetModelTiers(config.LLMConfig{
 		VanguardModel: "claude-opus-4-20250115",
 	})
 
-	// Without subscriptionSvc, tier resolves and uses default client with resolved name
 	_, model, _, _, usedCustom := f.GetLLMForModel("user1", "vanguard")
-	if !usedCustom {
-		t.Error("usedCustom should be true for tier resolution")
+	if usedCustom {
+		t.Error("usedCustom should be false when model not found in any subscription")
 	}
-	if model != "claude-opus-4-20250115" {
-		t.Errorf("model = %q, want claude-opus-4-20250115", model)
+	if model != "default-model" {
+		t.Errorf("model = %q, want default-model (fallback)", model)
 	}
 
-	// Non-tier model with no subscriptionSvc → fallback to default client with target model
+	// Non-tier model with no subscriptionSvc → same fallback
 	_, model, _, _, usedCustom = f.GetLLMForModel("user1", "gpt-4o")
-	if !usedCustom {
-		t.Error("usedCustom should be true when target model is specified")
+	if usedCustom {
+		t.Error("usedCustom should be false when model not found in any subscription")
+	}
+	if model != "default-model" {
+		t.Errorf("model = %q, want default-model (fallback)", model)
+	}
+}
+
+func TestResolveTierModel_UnconfiguredFallback(t *testing.T) {
+	// When swift/vanguard are not configured, should fallback to balance
+	f := NewLLMFactory(nil, nil, "default-model")
+	f.SetModelTiers(config.LLMConfig{
+		BalanceModel: "gpt-4o",
+		// VanguardModel and SwiftModel intentionally empty
+	})
+
+	// swift not configured → fallback to balance
+	model, usedTier := f.resolveTierModel("swift")
+	if !usedTier {
+		t.Error("usedTier should be true")
 	}
 	if model != "gpt-4o" {
-		t.Errorf("model = %q, want gpt-4o", model)
+		t.Errorf("swift fallback = %q, want gpt-4o (balance)", model)
+	}
+
+	// vanguard not configured → fallback to balance
+	model, usedTier = f.resolveTierModel("vanguard")
+	if !usedTier {
+		t.Error("usedTier should be true")
+	}
+	if model != "gpt-4o" {
+		t.Errorf("vanguard fallback = %q, want gpt-4o (balance)", model)
+	}
+
+	// balance configured → returns balance
+	model, usedTier = f.resolveTierModel("balance")
+	if !usedTier {
+		t.Error("usedTier should be true")
+	}
+	if model != "gpt-4o" {
+		t.Errorf("balance = %q, want gpt-4o", model)
+	}
+}
+
+func TestResolveTierModel_AllUnconfigured(t *testing.T) {
+	// All tiers unconfigured → returns empty string (will fall to default client)
+	f := NewLLMFactory(nil, nil, "default-model")
+	f.SetModelTiers(config.LLMConfig{})
+
+	model, usedTier := f.resolveTierModel("swift")
+	if !usedTier {
+		t.Error("usedTier should be true (tier keyword recognized)")
+	}
+	if model != "" {
+		t.Errorf("model = %q, want empty (no tiers configured)", model)
 	}
 }

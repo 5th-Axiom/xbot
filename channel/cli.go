@@ -80,8 +80,18 @@ func (c *CLIChannel) Start() error {
 	if c.pendingTrimHistoryFn != nil {
 		c.model.trimHistoryFn = c.pendingTrimHistoryFn
 	}
+	if c.pendingResetTokenStateFn != nil {
+		c.model.resetTokenStateFn = c.pendingResetTokenStateFn
+	}
 	if c.pendingCheckpointHook != nil {
 		c.model.checkpointHook = c.pendingCheckpointHook
+	}
+	if c.pendingSendInboundFn != nil {
+		c.model.sendInboundFn = c.pendingSendInboundFn
+	}
+	if c.pendingHistory != nil {
+		c.LoadHistory(c.pendingHistory)
+		c.pendingHistory = nil
 	}
 	c.model.channelName = "cli"
 	c.model.defaultChatID = c.config.ChatID
@@ -226,6 +236,7 @@ func (c *CLIChannel) Send(msg bus.OutboundMessage) (string, error) {
 	msgID := strings.ReplaceAll(uuid.New().String(), "-", "")
 
 	// 发送到消息通道，由 handleOutbound 处理
+	log.WithField("msg_id", msgID).WithField("content_len", len(msg.Content)).Debug("CLIChannel.Send: queuing")
 	select {
 	case c.msgChan <- msg:
 	default:
@@ -249,11 +260,54 @@ func (c *CLIChannel) SetApprovalHook(hook *tools.ApprovalHook) {
 	c.approvalHook = hook
 }
 
+// SetSendInboundFn overrides the default sendInbound behavior.
+// In remote mode, this forwards user messages to the server via backend.SendInbound
+// instead of the local bus (which has no agent loop).
+func (c *CLIChannel) SetSendInboundFn(fn func(bus.InboundMessage) bool) {
+	c.pendingSendInboundFn = fn
+}
+
 // SetBgTaskManager configures the background task manager for status display.
 func (c *CLIChannel) SetBgTaskManager(mgr *tools.BackgroundTaskManager, sessionKey string) {
 	c.bgTaskMgr = mgr
 	c.bgSessionKey = sessionKey
 	c.updateBgTaskCountFn()
+}
+
+// LoadHistory loads session history into the CLI model.
+// Used by remote mode where history must be fetched via RPC after the WS connection
+// is established (HistoryLoader runs during NewCLIChannel, before backend.Start()).
+// If the model hasn't been created yet (before Run()), the history is cached and
+// applied when the model is initialized.
+func (c *CLIChannel) LoadHistory(history []HistoryMessage) {
+	if len(history) == 0 {
+		return
+	}
+	c.programMu.Lock()
+	defer c.programMu.Unlock()
+	if c.model == nil {
+		// Model not created yet — cache for later application in newCLIModel
+		c.pendingHistory = history
+		log.WithField("count", len(history)).Info("Cached remote history (model not ready yet)")
+		return
+	}
+	for _, hm := range history {
+		cm := cliMessage{
+			role:      hm.Role,
+			content:   hm.Content,
+			timestamp: hm.Timestamp,
+			isPartial: false,
+			dirty:     true,
+		}
+		if len(hm.Iterations) > 0 {
+			cm.iterations = make([]cliIterationSnapshot, len(hm.Iterations))
+			for i, hi := range hm.Iterations {
+				cm.iterations[i] = cliIterationSnapshot(hi)
+			}
+		}
+		c.model.messages = append(c.model.messages, cm)
+	}
+	log.WithField("count", len(history)).Info("Restored session history (remote)")
 }
 
 // SetTrimHistoryFn sets the callback for /rewind DB truncation.
@@ -266,6 +320,18 @@ func (c *CLIChannel) SetTrimHistoryFn(fn func(cutoff time.Time) error) {
 		c.model.trimHistoryFn = fn
 	}
 	c.pendingTrimHistoryFn = fn
+}
+
+// SetResetTokenStateFn sets the callback for /rewind token state reset.
+// Must be called to prevent stale prompt_tokens from triggering immediate
+// compression after a rewind truncates history.
+func (c *CLIChannel) SetResetTokenStateFn(fn func()) {
+	c.programMu.Lock()
+	defer c.programMu.Unlock()
+	if c.model != nil {
+		c.model.resetTokenStateFn = fn
+	}
+	c.pendingResetTokenStateFn = fn
 }
 
 // SetCheckpointHook sets the file checkpoint hook for /rewind file rollback.
