@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"xbot/version"
+
 	"github.com/joho/godotenv"
 )
 
@@ -219,19 +221,28 @@ type PProfConfig struct {
 // XbotHome 返回 xbot 全局目录路径（$XBOT_HOME 或 ~/.xbot）。
 // 目录如果不存在会自动创建。
 func XbotHome() string {
-	dir := os.Getenv("XBOT_HOME")
+	dir := strings.TrimSpace(os.Getenv("XBOT_HOME"))
 	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			dir = ".xbot"
-		} else {
-			dir = filepath.Join(home, ".xbot")
-		}
+		dir = defaultXbotHome()
 	}
+	dir = filepath.Clean(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		slog.Warn("failed to create xbot home directory", "path", dir, "error", err)
 	}
 	return dir
+}
+
+func defaultXbotHome() string {
+	if version.BuildFlavor == "gui" {
+		if exe, err := os.Executable(); err == nil {
+			return filepath.Join(filepath.Dir(exe), ".xbot")
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".xbot"
+	}
+	return filepath.Join(home, ".xbot")
 }
 
 // ConfigFilePath 返回全局配置文件路径。

@@ -1,0 +1,192 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  --bg-base: #07111d;
+  --bg-deep: #0b1725;
+  --panel: rgba(12, 22, 34, 0.86);
+  --panel-strong: rgba(15, 30, 46, 0.96);
+  --border: rgba(148, 163, 184, 0.14);
+  --border-strong: rgba(148, 163, 184, 0.26);
+  --text-main: #ecf4ff;
+  --text-muted: #94a3b8;
+  --brand: #5ed7c1;
+  --brand-strong: #63c7ff;
+  --accent: #ffb86c;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  height: 100%;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at top left, rgba(94, 215, 193, 0.18), transparent 34%),
+    radial-gradient(circle at top right, rgba(99, 199, 255, 0.12), transparent 28%),
+    linear-gradient(180deg, #08111c 0%, #0a1521 46%, #08111a 100%);
+  color: var(--text-main);
+  font-family:
+    "Avenir Next",
+    "Segoe UI Variable Display",
+    "SF Pro Display",
+    "IBM Plex Sans",
+    "Noto Sans SC",
+    sans-serif;
+  letter-spacing: 0.01em;
+}
+
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  inset: auto;
+  pointer-events: none;
+  filter: blur(40px);
+  opacity: 0.7;
+  z-index: 0;
+}
+
+body::before {
+  top: 5%;
+  left: -6rem;
+  width: 18rem;
+  height: 18rem;
+  background: rgba(94, 215, 193, 0.18);
+}
+
+body::after {
+  right: -5rem;
+  bottom: 10%;
+  width: 16rem;
+  height: 16rem;
+  background: rgba(255, 184, 108, 0.12);
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(94, 215, 193, 0.28);
+  color: white;
+}
+
+.app-shell {
+  position: relative;
+  min-height: 100vh;
+  isolation: isolate;
+  background-image:
+    linear-gradient(rgba(148, 163, 184, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.04) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.app-shell__glow {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(60px);
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.app-shell__glow--one {
+  top: 6rem;
+  right: 16%;
+  width: 18rem;
+  height: 18rem;
+  background: rgba(94, 215, 193, 0.14);
+}
+
+.app-shell__glow--two {
+  bottom: 12%;
+  left: 12%;
+  width: 14rem;
+  height: 14rem;
+  background: rgba(99, 199, 255, 0.12);
+}
+
+.surface-panel {
+  border: 1px solid var(--border);
+  background:
+    linear-gradient(180deg, rgba(17, 31, 46, 0.96), rgba(10, 18, 28, 0.92));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 24px 60px rgba(2, 6, 12, 0.32);
+  backdrop-filter: blur(18px);
+}
+
+.surface-panel-muted {
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: linear-gradient(180deg, rgba(14, 27, 41, 0.9), rgba(9, 16, 25, 0.88));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
+}
+
+.surface-outline {
+  border: 1px solid var(--border-strong);
+  background: rgba(10, 18, 28, 0.42);
+  backdrop-filter: blur(12px);
+}
+
+.panel-grid {
+  position: relative;
+  overflow: hidden;
+}
+
+.panel-grid::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 100% 0, rgba(99, 199, 255, 0.12), transparent 28%),
+    linear-gradient(135deg, rgba(94, 215, 193, 0.04), transparent 45%);
+  pointer-events: none;
+}
+
+.eyebrow {
+  font-size: 0.7rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: #7dd4c4;
+}
+
+.page-title {
+  font-size: clamp(1.7rem, 3vw, 2.6rem);
+  line-height: 1.02;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  color: white;
+}
+
+.page-copy {
+  color: rgba(203, 213, 225, 0.82);
+  line-height: 1.7;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(71, 85, 105, 0.72);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.9);
+}
