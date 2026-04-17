@@ -93,14 +93,20 @@ export default function App() {
     return <LoginPage onLogin={handleLogin} onSendCode={handleSendCode} />;
   }
 
-  if (page === "profile") {
-    return (
-      <ProfilePage
-        onBack={() => setPage("chat")}
-        onLogout={handleLogout}
-      />
-    );
-  }
-
-  return <ChatPage onOpenProfile={() => setPage("profile")} />;
+  // Chat and Profile are both rendered but only one is visible.
+  // This keeps ChatPage mounted (WS connected, messages preserved)
+  // when the user visits Profile and comes back.
+  return (
+    <>
+      <div style={{ display: page === "chat" ? "contents" : "none" }}>
+        <ChatPage onOpenProfile={() => setPage("profile")} />
+      </div>
+      {page === "profile" && (
+        <ProfilePage
+          onBack={() => setPage("chat")}
+          onLogout={handleLogout}
+        />
+      )}
+    </>
+  );
 }
