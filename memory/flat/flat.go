@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"xbot/config"
 	"xbot/llm"
 	log "xbot/logger"
 	"xbot/memory"
@@ -53,14 +54,7 @@ func New(tenantID int64, baseDir string) *FlatMemory {
 // NewFromLegacy creates a FlatMemory with the old SQLite-based signature.
 // Kept for backward compatibility during migration.
 func NewFromLegacy(tenantID int64, _ *vectordb.ToolIndexService) *FlatMemory {
-	home := os.Getenv("XBOT_HOME")
-	if home == "" {
-		if h, err := os.UserHomeDir(); err == nil {
-			home = filepath.Join(h, ".xbot")
-		} else {
-			home = ".xbot"
-		}
-	}
+	home := config.XbotHome()
 	baseDir := filepath.Join(home, "memory", fmt.Sprintf("tenant_%d", tenantID))
 	os.MkdirAll(baseDir, 0o755)
 	return &FlatMemory{

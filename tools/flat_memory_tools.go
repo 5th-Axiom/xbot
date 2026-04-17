@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"xbot/config"
 	"xbot/llm"
 	log "xbot/logger"
 )
@@ -122,13 +123,6 @@ func flatMemoryDir(ctx *ToolContext) string {
 	if tenantID == 0 {
 		tenantID = 1 // fallback
 	}
-	home := os.Getenv("XBOT_HOME")
-	if home == "" {
-		if h, err := os.UserHomeDir(); err == nil {
-			home = filepath.Join(h, ".xbot")
-		} else {
-			home = ".xbot"
-		}
-	}
+	home := config.XbotHome()
 	return filepath.Join(home, "memory", fmt.Sprintf("%d", tenantID))
 }

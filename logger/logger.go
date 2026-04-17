@@ -38,7 +38,8 @@ type SetupConfig struct {
 	LogDir     string // 直接指定日志目录（优先于 WorkDir）
 	MaxAge     int    // 日志保留天数（默认 7 天）
 	MaxBackups int    // 保留的旧日志文件数量（默认 0，表示不限制）
-	FileOnly   bool   // true: only write to log file, suppress stdout (for TUI modes)
+	FileOnly    bool      // true: only write to log file, suppress stdout (for TUI modes)
+	ExtraWriter io.Writer // if non-nil, log output is also tee'd to this writer
 }
 
 // dailyRotateFile 支持按日轮转的日志文件写入器
@@ -168,11 +169,14 @@ func Setup(cfg SetupConfig) error {
 			return fmt.Errorf("failed to create log rotator: %w", err)
 		}
 
-		if cfg.FileOnly {
-			log.SetOutput(drf)
-		} else {
-			log.SetOutput(io.MultiWriter(os.Stdout, drf))
+		writers := []io.Writer{drf}
+		if !cfg.FileOnly {
+			writers = append(writers, os.Stdout)
 		}
+		if cfg.ExtraWriter != nil {
+			writers = append(writers, cfg.ExtraWriter)
+		}
+		log.SetOutput(io.MultiWriter(writers...))
 		globalRotateFileMu.Lock()
 		globalRotateFile = drf
 		globalRotateFileMu.Unlock()

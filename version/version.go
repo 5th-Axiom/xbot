@@ -6,9 +6,10 @@ import "fmt"
 //
 //	go build -ldflags "-X xbot/version.Version=v1.0.0 -X xbot/version.Commit=$(git rev-parse --short HEAD) -X xbot/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 var (
-	Version   = "dev"
-	Commit    = "unknown"
-	BuildTime = "unknown"
+	Version     = "dev"
+	Commit      = "unknown"
+	BuildTime   = "unknown"
+	BuildFlavor = "standard"
 )
 
 // Info returns a formatted version string.

@@ -404,7 +404,8 @@ type WebChannel struct {
 	listener net.Listener
 
 	// Callbacks from main
-	callbacks WebCallbacks
+	callbacks      WebCallbacks
+	adminCallbacks AdminCallbacks
 
 	// Auth
 	sessions   map[string]sessionInfo // token → sessionInfo
@@ -470,6 +471,11 @@ func (wc *WebChannel) SetCallbacks(cb WebCallbacks) {
 	wc.callbacks = cb
 }
 
+// SetAdminCallbacks sets the admin API callbacks.
+func (wc *WebChannel) SetAdminCallbacks(cb AdminCallbacks) {
+	wc.adminCallbacks = cb
+}
+
 func (wc *WebChannel) Name() string { return "web" }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +523,13 @@ func (wc *WebChannel) Start() error {
 
 	// File API
 	mux.HandleFunc("/api/files/upload", wc.authMiddleware(wc.handleFileUpload))
+
+	// Admin API (requires admin token)
+	mux.HandleFunc("/api/admin/health", wc.adminTokenMiddleware(wc.handleAdminHealth))
+	mux.HandleFunc("/api/admin/metrics", wc.adminTokenMiddleware(wc.handleAdminMetrics))
+	mux.HandleFunc("/api/admin/users", wc.adminTokenMiddleware(wc.handleAdminUsers))
+	mux.HandleFunc("/api/admin/users/delete", wc.adminTokenMiddleware(wc.handleAdminDeleteUser))
+	mux.HandleFunc("/api/admin/channels", wc.adminTokenMiddleware(wc.handleAdminChannels))
 
 	// Static files
 	if wc.staticDir != "" {
@@ -714,6 +727,11 @@ func (wc *WebChannel) wsUpgrader() *websocket.Upgrader {
 			if origin == "" {
 				return true // non-browser clients
 			}
+			// CLI/Runner clients authenticate via token query param — origin
+			// check is unnecessary (embedded GUI webviews use arbitrary origins).
+			if r.URL.Query().Get("client_type") == "cli" {
+				return true
+			}
 			u, err := url.Parse(origin)
 			if err != nil {
 				return false
@@ -723,6 +741,11 @@ func (wc *WebChannel) wsUpgrader() *websocket.Upgrader {
 				if pu, err := url.Parse(wc.config.PublicURL); err == nil && u.Host == pu.Host {
 					return true
 				}
+			}
+			// Allow loopback hosts unconditionally (desktop/dev scenarios).
+			host := u.Hostname()
+			if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+				return true
 			}
 			return u.Host == r.Host
 		},
@@ -739,7 +762,17 @@ func (wc *WebChannel) handleWS(w http.ResponseWriter, r *http.Request) {
 		var err error
 		senderID, err = wc.validateCLIToken(token)
 		if err != nil {
-			log.WithError(err).Warn("CLI token auth failed")
+			// DEBUG: log token prefix + origin to figure out who's flooding the WS
+			tokenPrefix := token
+			if len(tokenPrefix) > 8 {
+				tokenPrefix = tokenPrefix[:8] + "..."
+			}
+			log.WithError(err).WithFields(log.Fields{
+				"token_prefix": tokenPrefix,
+				"origin":       r.Header.Get("Origin"),
+				"user_agent":   r.Header.Get("User-Agent"),
+				"remote_addr":  r.RemoteAddr,
+			}).Warn("CLI token auth failed")
 			jsonErrorResponse(w, http.StatusUnauthorized, "invalid token")
 			return
 		}
