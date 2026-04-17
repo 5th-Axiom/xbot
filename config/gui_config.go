@@ -11,7 +11,18 @@ import (
 // GUIConfig stores desktop GUI-specific settings that should not live in the
 // main server config.
 type GUIConfig struct {
-	Auth GUIAuthConfig `json:"auth"`
+	Auth GUIAuthConfig  `json:"auth"`
+	LLM  GUILLMConfig   `json:"llm"`
+}
+
+// GUILLMConfig stores the LLM provider settings for the desktop GUI.
+// These are read at server startup. Never hard-code secrets here — use
+// this struct or environment variables.
+type GUILLMConfig struct {
+	Provider string `json:"provider"`
+	BaseURL  string `json:"base_url"`
+	APIKey   string `json:"api_key"`
+	Model    string `json:"model"`
 }
 
 // GUIAuthConfig stores desktop GUI authentication settings.

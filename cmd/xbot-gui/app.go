@@ -1,3 +1,5 @@
+//go:build gui
+
 package main
 
 import (
@@ -325,23 +327,42 @@ type LLMConfigSpec struct {
 	Model    string `json:"model"`
 }
 
-// mockLLMConfig returns a hard-coded LLM config used to auto-configure the
-// embedded server on first launch. In the future this will call the A2A API.
-func mockLLMConfig() LLMConfigSpec {
-	return LLMConfigSpec{
-		Provider: "openai",
-		BaseURL:  "https://dashscope.aliyuncs.com/compatible-mode/v1",
-		APIKey:   "sk-7917ec38206f415988f2837629a1d8b6",
-		Model:    "qwen3.5-flash",
+// loadLLMConfig reads LLM settings from gui-config.json, then falls back to
+// environment variables. No secrets are hard-coded in source.
+func loadLLMConfig() LLMConfigSpec {
+	cfg := config.LoadGUIConfig()
+	spec := LLMConfigSpec{
+		Provider: cfg.LLM.Provider,
+		BaseURL:  cfg.LLM.BaseURL,
+		APIKey:   cfg.LLM.APIKey,
+		Model:    cfg.LLM.Model,
 	}
+	// Env overrides
+	if v := os.Getenv("LLM_PROVIDER"); v != "" {
+		spec.Provider = v
+	}
+	if v := os.Getenv("LLM_BASE_URL"); v != "" {
+		spec.BaseURL = v
+	}
+	if v := os.Getenv("LLM_API_KEY"); v != "" {
+		spec.APIKey = v
+	}
+	if v := os.Getenv("LLM_MODEL"); v != "" {
+		spec.Model = v
+	}
+	// Defaults
+	if spec.Provider == "" {
+		spec.Provider = "openai"
+	}
+	return spec
 }
 
 // GetLLMConfig returns the LLM configuration (mock for now, real API later).
 // API key is masked for display.
 func (a *App) GetLLMConfig() (LLMConfigSpec, error) {
-	cfg := mockLLMConfig()
-	cfg.APIKey = maskAPIKey(cfg.APIKey)
-	return cfg, nil
+	spec := loadLLMConfig()
+	spec.APIKey = maskAPIKey(spec.APIKey)
+	return spec, nil
 }
 
 // GetServerInfo returns connection info for the embedded server (port + admin token).
@@ -349,10 +370,19 @@ func (a *App) GetLLMConfig() (LLMConfigSpec, error) {
 func (a *App) GetServerInfo() map[string]interface{} {
 	a.srvMu.RLock()
 	defer a.srvMu.RUnlock()
+
+	userID := "admin"
+	if session, err := a.readDesktopSession(); err == nil && session != nil {
+		if session.UserUID != "" {
+			userID = session.UserUID
+		}
+	}
+
 	return map[string]interface{}{
 		"running":     a.running,
 		"port":        a.serverPort,
 		"admin_token": a.adminToken,
+		"user_id":     userID,
 	}
 }
 
@@ -757,19 +787,19 @@ func applyGUIOverrides(cfg *config.Config) {
 	}
 
 	// Mock LLM config (will be replaced by A2A API fetch later)
-	mock := mockLLMConfig()
-	cfg.LLM.Provider = mock.Provider
-	cfg.LLM.BaseURL = mock.BaseURL
-	cfg.LLM.APIKey = mock.APIKey
-	cfg.LLM.Model = mock.Model
+	llmSpec := loadLLMConfig()
+	cfg.LLM.Provider = llmSpec.Provider
+	cfg.LLM.BaseURL = llmSpec.BaseURL
+	cfg.LLM.APIKey = llmSpec.APIKey
+	cfg.LLM.Model = llmSpec.Model
 	// Ensure subscriptions are consistent with cfg.LLM so the factory picks it up
 	cfg.Subscriptions = []config.SubscriptionConfig{{
 		ID:       "gui-default",
 		Name:     "GUI Default",
-		Provider: mock.Provider,
-		BaseURL:  mock.BaseURL,
-		APIKey:   mock.APIKey,
-		Model:    mock.Model,
+		Provider: llmSpec.Provider,
+		BaseURL:  llmSpec.BaseURL,
+		APIKey:   llmSpec.APIKey,
+		Model:    llmSpec.Model,
 		Active:   true,
 	}}
 

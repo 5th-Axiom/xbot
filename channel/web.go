@@ -762,19 +762,16 @@ func (wc *WebChannel) handleWS(w http.ResponseWriter, r *http.Request) {
 		var err error
 		senderID, err = wc.validateCLIToken(token)
 		if err != nil {
-			// DEBUG: log token prefix + origin to figure out who's flooding the WS
-			tokenPrefix := token
-			if len(tokenPrefix) > 8 {
-				tokenPrefix = tokenPrefix[:8] + "..."
-			}
-			log.WithError(err).WithFields(log.Fields{
-				"token_prefix": tokenPrefix,
-				"origin":       r.Header.Get("Origin"),
-				"user_agent":   r.Header.Get("User-Agent"),
-				"remote_addr":  r.RemoteAddr,
-			}).Warn("CLI token auth failed")
+			log.WithError(err).Warn("CLI token auth failed")
 			jsonErrorResponse(w, http.StatusUnauthorized, "invalid token")
 			return
+		}
+		// When admin authenticates, allow overriding senderID via ?user_id param.
+		// This lets the GUI desktop app bind chat sessions to the actual A2A user.
+		if senderID == "admin" {
+			if uid := r.URL.Query().Get("user_id"); uid != "" {
+				senderID = uid
+			}
 		}
 		username = "cli:" + senderID
 	} else {

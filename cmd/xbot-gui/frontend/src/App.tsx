@@ -15,12 +15,18 @@ export default function App() {
   const [page, setPage] = useState<Page | null>(null);
   const [authError, setAuthError] = useState("");
 
-  // Check auth on startup
+  // Check auth on startup: verify local session then validate with server
   useEffect(() => {
     (async () => {
       try {
         const status = await GetAuthStatus();
-        if (status?.authenticated) {
+        if (!status?.authenticated) {
+          setPage("login");
+          return;
+        }
+        // Token exists locally — verify it's still valid
+        const refreshResult = await RefreshToken();
+        if (refreshResult?.authenticated) {
           setPage("chat");
         } else {
           setPage("login");

@@ -40,8 +40,8 @@ gui-frontend:
 
 gui: gui-frontend
 	rm -rf cmd/xbot-gui/build/bin/xbot-gui.app
-	cd cmd/xbot-gui && wails build
+	cd cmd/xbot-gui && wails build -tags gui
 	@echo "Built xbot-gui.app (server embedded in single binary)"
 
 gui-dev:
-	cd cmd/xbot-gui && wails dev
+	cd cmd/xbot-gui && wails dev -tags gui

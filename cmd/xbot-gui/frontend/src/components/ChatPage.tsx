@@ -37,6 +37,7 @@ interface ServerInfo {
   running: boolean;
   port: number;
   admin_token: string;
+  user_id: string;
 }
 
 interface LLMInfo {
@@ -175,7 +176,7 @@ export default function ChatPage({ onOpenProfile }: ChatPageProps) {
     setStatus("Connecting...");
     const url = `ws://127.0.0.1:${info.port}/ws?token=${encodeURIComponent(
       info.admin_token
-    )}&client_type=cli`;
+    )}&client_type=cli&user_id=${encodeURIComponent(info.user_id || "")}`;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;
