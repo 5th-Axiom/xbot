@@ -1,96 +1,100 @@
 import { useEffect, useState } from "react";
 import {
   GetAuthStatus,
-  Logout as LogoutApp,
-  RequestDesktopLoginCode,
-  VerifyDesktopLoginCode,
+  Login,
+  RefreshToken,
+  SendLoginCode,
 } from "../wailsjs/go/main/App";
 import ChatPage from "./components/ChatPage";
 import LoginPage from "./components/LoginPage";
+import ProfilePage from "./components/ProfilePage";
 
-interface AuthStatus {
-  authenticated: boolean;
-}
+type Page = "login" | "chat" | "profile";
 
 export default function App() {
-  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
+  const [page, setPage] = useState<Page | null>(null);
   const [authError, setAuthError] = useState("");
 
-  const refreshAuth = async () => {
-    try {
-      const status = await GetAuthStatus();
-      setAuthStatus({ authenticated: Boolean(status?.authenticated) });
-      setAuthError("");
-    } catch (e: any) {
-      setAuthError(e?.message || "Failed to check login status");
-    }
-  };
-
+  // Check auth on startup
   useEffect(() => {
-    refreshAuth();
+    (async () => {
+      try {
+        const status = await GetAuthStatus();
+        if (status?.authenticated) {
+          setPage("chat");
+        } else {
+          setPage("login");
+        }
+        setAuthError("");
+      } catch (e: any) {
+        setAuthError(e?.message || "Failed to check auth");
+        setPage("login");
+      }
+    })();
   }, []);
+
+  // Periodic JWT refresh (every 10 minutes)
+  useEffect(() => {
+    if (page !== "chat" && page !== "profile") return;
+
+    const interval = setInterval(async () => {
+      try {
+        const result = await RefreshToken();
+        if (!result?.authenticated) {
+          setPage("login");
+        }
+      } catch {
+        // refresh failed silently, next interval will retry
+      }
+    }, 10 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, [page]);
 
   const handleLogin = async (
     countryCode: string,
     phoneNumber: string,
-    verificationCode: string
+    code: string
   ) => {
-    await VerifyDesktopLoginCode(countryCode, phoneNumber, verificationCode);
-    await refreshAuth();
+    await Login(countryCode, phoneNumber, code);
+    setPage("chat");
   };
 
   const handleSendCode = async (countryCode: string, phoneNumber: string) => {
-    const result = await RequestDesktopLoginCode(countryCode, phoneNumber);
-    return {
-      deliveryMessage: String(result?.delivery_message || ""),
-      expiresInSeconds: Number(result?.expires_in_seconds || 0),
-    };
+    const result = await SendLoginCode(countryCode, phoneNumber);
+    return { message: String(result?.message || "Code sent.") };
   };
 
-  const handleLogout = async () => {
-    try {
-      await LogoutApp();
-      setAuthStatus({ authenticated: false });
-    } catch (e: any) {
-      alert("Failed to log out: " + (e?.message || e));
-    }
+  const handleLogout = () => {
+    setPage("login");
   };
 
-  if (!authStatus && !authError) {
+  // Loading state
+  if (page === null) {
     return (
       <div className="app-shell flex min-h-screen items-center justify-center px-6">
-        <div className="surface-panel panel-grid w-full max-w-xl rounded-[2rem] px-6 py-8 text-center">
-          <div className="eyebrow">Session Check</div>
-          <h1 className="mt-3 page-title">Opening the workspace</h1>
-          <p className="page-copy mt-4 text-sm md:text-base">
-            Checking whether you are already signed in.
+        <div className="surface-panel panel-grid w-full max-w-sm rounded-[2rem] px-6 py-8 text-center">
+          <div className="eyebrow">xbot</div>
+          <p className="page-copy mt-3 text-sm">
+            {authError || "Checking session..."}
           </p>
         </div>
       </div>
     );
   }
 
-  if (authError) {
-    return (
-      <div className="app-shell flex min-h-screen items-center justify-center px-6">
-        <div className="surface-panel panel-grid w-full max-w-xl rounded-[2rem] px-6 py-8 text-center">
-          <div className="eyebrow">Authentication Error</div>
-          <h1 className="mt-3 page-title">Unable to verify login state</h1>
-          <p className="page-copy mt-4 text-sm md:text-base">{authError}</p>
-          <button
-            onClick={refreshAuth}
-            className="mx-auto mt-6 rounded-2xl border border-cyan-300/20 bg-cyan-500/12 px-5 py-3 text-sm font-medium text-cyan-50 transition hover:bg-cyan-500/18"
-          >
-            Try Again
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (!authStatus?.authenticated) {
+  if (page === "login") {
     return <LoginPage onLogin={handleLogin} onSendCode={handleSendCode} />;
   }
 
-  return <ChatPage onLogout={handleLogout} />;
+  if (page === "profile") {
+    return (
+      <ProfilePage
+        onBack={() => setPage("chat")}
+        onLogout={handleLogout}
+      />
+    );
+  }
+
+  return <ChatPage onOpenProfile={() => setPage("profile")} />;
 }

@@ -27,6 +27,9 @@ const (
 	guiSessionFileName = "gui-session.json"
 	a2aBaseURL         = "https://5th-axiom.com/api/v2"
 	a2aRequestTimeout  = 20 * time.Second
+	// devBypass: set to true to skip real SMS/login API and accept code "123456".
+	devBypass     = false
+	devBypassCode = "123456"
 )
 
 // guiSession persists the authenticated user's JWT and identity.
@@ -113,34 +116,29 @@ func (a *App) GetAuthStatus() (map[string]interface{}, error) {
 	authenticated := session != nil && strings.TrimSpace(session.Token) != ""
 
 	result := map[string]interface{}{
-		"authenticated":  authenticated,
-		"login_required": true,
+		"authenticated": authenticated,
 	}
 	if authenticated {
 		result["phone"] = session.Phone
 		result["user_uid"] = session.UserUID
+		result["agent_uid"] = session.AgentUID
 		result["agent_name"] = session.AgentName
 	}
 	return result, nil
 }
 
-// Logout clears the persisted desktop GUI session.
+// Logout clears the local session and notifies the A2A server.
 func (a *App) Logout() error {
 	a.authMu.Lock()
 	defer a.authMu.Unlock()
-	// Best-effort: notify server
 	if session, err := a.readDesktopSession(); err == nil && session != nil && session.Token != "" {
 		_, _ = a.a2aRequest("POST", "/auth/logout", nil, session.Token)
 	}
 	return a.clearDesktopSession()
 }
 
-// devBypassCode is the hard-coded verification code accepted in dev mode.
-const devBypassCode = "123456"
-
-// RequestDesktopLoginCode — DEV MODE: skips the real SMS send and just
-// returns success. Any phone number + code 123456 will log in.
-func (a *App) RequestDesktopLoginCode(countryCode, phoneNumber string) (map[string]interface{}, error) {
+// SendLoginCode sends a verification code to the given phone number.
+func (a *App) SendLoginCode(countryCode, phoneNumber string) (map[string]interface{}, error) {
 	a.authMu.Lock()
 	defer a.authMu.Unlock()
 
@@ -149,20 +147,22 @@ func (a *App) RequestDesktopLoginCode(countryCode, phoneNumber string) (map[stri
 		return nil, err
 	}
 
-	// --- Dev bypass: real send-code API disabled for now ---
-	// if _, err := a.a2aRequest("POST", "/auth/send-code", map[string]string{"phone": fullPhone}, ""); err != nil {
-	// 	return nil, err
-	// }
+	if devBypass {
+		return map[string]interface{}{
+			"message": fmt.Sprintf("Dev mode: use code %s for %s.", devBypassCode, maskFullPhone(fullPhone)),
+		}, nil
+	}
 
+	if _, err := a.a2aRequest("POST", "/auth/send-code", map[string]string{"phone": fullPhone}, ""); err != nil {
+		return nil, err
+	}
 	return map[string]interface{}{
-		"delivery_message":   fmt.Sprintf("Dev mode: use code %s to sign in as %s.", devBypassCode, maskFullPhone(fullPhone)),
-		"expires_in_seconds": 300,
+		"message": fmt.Sprintf("Verification code sent to %s.", maskFullPhone(fullPhone)),
 	}, nil
 }
 
-// VerifyDesktopLoginCode — DEV MODE: accepts any phone with code 123456.
-// Skips the real /auth/login API call and writes a local-only session.
-func (a *App) VerifyDesktopLoginCode(countryCode, phoneNumber, code string) error {
+// Login verifies the code and persists the JWT session.
+func (a *App) Login(countryCode, phoneNumber, code string) error {
 	a.authMu.Lock()
 	defer a.authMu.Unlock()
 
@@ -175,50 +175,138 @@ func (a *App) VerifyDesktopLoginCode(countryCode, phoneNumber, code string) erro
 		return errors.New("verification code is required")
 	}
 
-	// --- Dev bypass: check against the fixed code instead of calling the API ---
-	if trimmedCode != devBypassCode {
-		return errors.New("invalid verification code")
+	if devBypass {
+		if trimmedCode != devBypassCode {
+			return errors.New("invalid verification code")
+		}
+		devToken, _ := generateAdminToken()
+		return a.writeDesktopSession(guiSession{
+			Token: "dev-" + devToken, Phone: fullPhone,
+			UserUID: "dev-user", AgentUID: "dev-agent",
+		})
 	}
 
-	// // --- Real A2A login (disabled for dev) ---
-	// data, err := a.a2aRequest("POST", "/auth/login", map[string]string{
-	// 	"phone": fullPhone,
-	// 	"code":  trimmedCode,
-	// }, "")
-	// if err != nil {
-	// 	return err
-	// }
-	// var loginRes struct {
-	// 	Token string `json:"token"`
-	// 	User  struct {
-	// 		UID   string `json:"uid"`
-	// 		Phone string `json:"phone"`
-	// 		Agent struct {
-	// 			UID  string `json:"uid"`
-	// 			Name string `json:"name"`
-	// 		} `json:"agent"`
-	// 	} `json:"user"`
-	// }
-	// if err := json.Unmarshal(data, &loginRes); err != nil {
-	// 	return fmt.Errorf("parse login response: %w", err)
-	// }
-	// if loginRes.Token == "" {
-	// 	return errors.New("server did not return a token")
-	// }
-
-	devToken, err := generateAdminToken()
+	data, err := a.a2aRequest("POST", "/auth/login", map[string]string{
+		"phone": fullPhone, "code": trimmedCode,
+	}, "")
 	if err != nil {
-		return fmt.Errorf("generate dev token: %w", err)
+		return err
+	}
+	var res struct {
+		Token string `json:"token"`
+		User  struct {
+			UID   string `json:"uid"`
+			Phone string `json:"phone"`
+			Agent struct {
+				UID  string `json:"uid"`
+				Name string `json:"name"`
+			} `json:"agent"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(data, &res); err != nil {
+		return fmt.Errorf("parse login response: %w", err)
+	}
+	if res.Token == "" {
+		return errors.New("server did not return a token")
+	}
+	return a.writeDesktopSession(guiSession{
+		Token:     res.Token,
+		Phone:     fullPhone,
+		UserUID:   res.User.UID,
+		AgentUID:  res.User.Agent.UID,
+		AgentName: res.User.Agent.Name,
+	})
+}
+
+// RefreshToken silently refreshes the JWT. Returns the new auth status.
+// If refresh fails, the session is cleared (frontend should redirect to login).
+func (a *App) RefreshToken() (map[string]interface{}, error) {
+	a.authMu.Lock()
+	defer a.authMu.Unlock()
+
+	session, err := a.readDesktopSession()
+	if err != nil || session == nil || session.Token == "" {
+		_ = a.clearDesktopSession()
+		return map[string]interface{}{"authenticated": false}, nil
 	}
 
-	session := guiSession{
-		Token:     "dev-" + devToken,
-		Phone:     fullPhone,
-		UserUID:   "dev-user",
-		AgentUID:  "",
-		AgentName: "",
+	if devBypass {
+		return map[string]interface{}{"authenticated": true}, nil
 	}
-	return a.writeDesktopSession(session)
+
+	data, err := a.a2aRequest("POST", "/auth/refresh", nil, session.Token)
+	if err != nil {
+		_ = a.clearDesktopSession()
+		return map[string]interface{}{"authenticated": false}, nil
+	}
+	var res struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(data, &res); err != nil || res.Token == "" {
+		_ = a.clearDesktopSession()
+		return map[string]interface{}{"authenticated": false}, nil
+	}
+	session.Token = res.Token
+	_ = a.writeDesktopSession(*session)
+	return map[string]interface{}{"authenticated": true}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Agent Profile (A2A API)
+// ---------------------------------------------------------------------------
+
+// AgentProfile represents the agent's public profile on the A2A platform.
+type AgentProfile struct {
+	UID           string   `json:"uid,omitempty"`
+	Name          string   `json:"name"`
+	Bio           string   `json:"bio"`
+	Tags          []string `json:"tags"`
+	Goals         string   `json:"goals"`
+	RecentContext string   `json:"recent_context"`
+	LookingFor    string   `json:"looking_for"`
+	City          string   `json:"city"`
+	Status        string   `json:"status,omitempty"`
+}
+
+// GetProfile fetches the current agent profile from the A2A API.
+func (a *App) GetProfile() (*AgentProfile, error) {
+	token, err := a.getSessionToken()
+	if err != nil {
+		return nil, err
+	}
+	data, err := a.a2aRequest("GET", "/agents/me", nil, token)
+	if err != nil {
+		return nil, err
+	}
+	var profile AgentProfile
+	if err := json.Unmarshal(data, &profile); err != nil {
+		return nil, fmt.Errorf("parse profile: %w", err)
+	}
+	return &profile, nil
+}
+
+// UpdateProfile patches the agent profile on the A2A API.
+func (a *App) UpdateProfile(profile *AgentProfile) error {
+	token, err := a.getSessionToken()
+	if err != nil {
+		return err
+	}
+	_, err = a.a2aRequest("PATCH", "/agents/me", profile, token)
+	return err
+}
+
+// getSessionToken reads the JWT from the persisted session.
+func (a *App) getSessionToken() (string, error) {
+	a.authMu.Lock()
+	defer a.authMu.Unlock()
+	session, err := a.readDesktopSession()
+	if err != nil {
+		return "", errors.New("not logged in")
+	}
+	if session.Token == "" {
+		return "", errors.New("not logged in")
+	}
+	return session.Token, nil
 }
 
 // ---------------------------------------------------------------------------

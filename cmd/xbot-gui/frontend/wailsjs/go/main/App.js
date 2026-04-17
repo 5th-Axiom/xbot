@@ -42,6 +42,10 @@ export function GetMetrics() {
   return window['go']['main']['App']['GetMetrics']();
 }
 
+export function GetProfile() {
+  return window['go']['main']['App']['GetProfile']();
+}
+
 export function GetServerInfo() {
   return window['go']['main']['App']['GetServerInfo']();
 }
@@ -62,12 +66,16 @@ export function LoadConfig() {
   return window['go']['main']['App']['LoadConfig']();
 }
 
+export function Login(arg1, arg2, arg3) {
+  return window['go']['main']['App']['Login'](arg1, arg2, arg3);
+}
+
 export function Logout() {
   return window['go']['main']['App']['Logout']();
 }
 
-export function RequestDesktopLoginCode(arg1, arg2) {
-  return window['go']['main']['App']['RequestDesktopLoginCode'](arg1, arg2);
+export function RefreshToken() {
+  return window['go']['main']['App']['RefreshToken']();
 }
 
 export function RestartServer() {
@@ -78,6 +86,10 @@ export function SaveConfig(arg1) {
   return window['go']['main']['App']['SaveConfig'](arg1);
 }
 
+export function SendLoginCode(arg1, arg2) {
+  return window['go']['main']['App']['SendLoginCode'](arg1, arg2);
+}
+
 export function StartServer() {
   return window['go']['main']['App']['StartServer']();
 }
@@ -86,6 +98,6 @@ export function StopServer() {
   return window['go']['main']['App']['StopServer']();
 }
 
-export function VerifyDesktopLoginCode(arg1, arg2, arg3) {
-  return window['go']['main']['App']['VerifyDesktopLoginCode'](arg1, arg2, arg3);
+export function UpdateProfile(arg1) {
+  return window['go']['main']['App']['UpdateProfile'](arg1);
 }

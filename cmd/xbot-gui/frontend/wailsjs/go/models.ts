@@ -455,6 +455,34 @@ export namespace config {
 
 export namespace main {
 	
+	export class AgentProfile {
+	    uid?: string;
+	    name: string;
+	    bio: string;
+	    tags: string[];
+	    goals: string;
+	    recent_context: string;
+	    looking_for: string;
+	    city: string;
+	    status?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new AgentProfile(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.uid = source["uid"];
+	        this.name = source["name"];
+	        this.bio = source["bio"];
+	        this.tags = source["tags"];
+	        this.goals = source["goals"];
+	        this.recent_context = source["recent_context"];
+	        this.looking_for = source["looking_for"];
+	        this.city = source["city"];
+	        this.status = source["status"];
+	    }
+	}
 	export class LLMConfigSpec {
 	    provider: string;
 	    base_url: string;

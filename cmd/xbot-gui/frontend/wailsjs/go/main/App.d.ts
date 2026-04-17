@@ -23,6 +23,8 @@ export function GetLogs(arg1:number):Promise<Array<string>>;
 
 export function GetMetrics():Promise<Record<string, any>>;
 
+export function GetProfile():Promise<main.AgentProfile>;
+
 export function GetServerInfo():Promise<Record<string, any>>;
 
 export function GetUptime():Promise<number>;
@@ -33,16 +35,20 @@ export function ListUsers():Promise<Array<Record<string, any>>>;
 
 export function LoadConfig():Promise<config.Config>;
 
+export function Login(arg1:string,arg2:string,arg3:string):Promise<void>;
+
 export function Logout():Promise<void>;
 
-export function RequestDesktopLoginCode(arg1:string,arg2:string):Promise<Record<string, any>>;
+export function RefreshToken():Promise<Record<string, any>>;
 
 export function RestartServer():Promise<void>;
 
 export function SaveConfig(arg1:config.Config):Promise<void>;
 
+export function SendLoginCode(arg1:string,arg2:string):Promise<Record<string, any>>;
+
 export function StartServer():Promise<void>;
 
 export function StopServer():Promise<void>;
 
-export function VerifyDesktopLoginCode(arg1:string,arg2:string,arg3:string):Promise<void>;
+export function UpdateProfile(arg1:main.AgentProfile):Promise<void>;

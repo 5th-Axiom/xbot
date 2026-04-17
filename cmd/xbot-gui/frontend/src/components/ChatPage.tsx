@@ -50,7 +50,11 @@ function genID(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-export default function ChatPage({ onLogout }: { onLogout: () => void }) {
+interface ChatPageProps {
+  onOpenProfile: () => void;
+}
+
+export default function ChatPage({ onOpenProfile }: ChatPageProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [connected, setConnected] = useState(false);
@@ -281,9 +285,24 @@ export default function ChatPage({ onLogout }: { onLogout: () => void }) {
     });
   }, []);
 
+  const clearContext = useCallback(() => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    wsRef.current.send(JSON.stringify({ type: "message", content: "/new" }));
+    setMessages([]);
+    setLoading(false);
+    setThinking("");
+    assistantBufRef.current = null;
+  }, []);
+
   const handleSend = useCallback(() => {
     const text = input.trim();
     if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+    if (text === "/clear" || text === "/new") {
+      setInput("");
+      clearContext();
+      return;
+    }
 
     const msg: ChatMessage = {
       id: genID(),
@@ -298,7 +317,7 @@ export default function ChatPage({ onLogout }: { onLogout: () => void }) {
 
     wsRef.current.send(JSON.stringify({ type: "message", content: text }));
     scrollToBottom();
-  }, [input, scrollToBottom]);
+  }, [input, scrollToBottom, clearContext]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -351,10 +370,13 @@ export default function ChatPage({ onLogout }: { onLogout: () => void }) {
             {connected ? "Online" : status}
           </span>
           <button
-            onClick={onLogout}
-            className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-200 transition hover:bg-white/[0.08]"
+            onClick={onOpenProfile}
+            title="Profile & Settings"
+            className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/[0.06] text-slate-300 transition hover:bg-white/[0.12] hover:text-white"
           >
-            Logout
+            <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4">
+              <path d="M10 10.25a2.75 2.75 0 1 0 0-5.5 2.75 2.75 0 0 0 0 5.5Zm-5 5.5c0-2.42 2.24-4 5-4s5 1.58 5 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
           </button>
         </div>
       </header>
@@ -399,7 +421,17 @@ export default function ChatPage({ onLogout }: { onLogout: () => void }) {
 
       {/* Input */}
       <div className="relative z-10 border-t border-white/8 bg-slate-950/40 px-6 py-4 backdrop-blur-xl">
-        <div className="mx-auto flex max-w-3xl items-end gap-3">
+        <div className="mx-auto flex max-w-3xl items-end gap-2">
+          <button
+            onClick={clearContext}
+            disabled={!connected || messages.length === 0}
+            title="Clear context"
+            className="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-slate-400 transition hover:bg-white/[0.08] hover:text-white disabled:opacity-30"
+          >
+            <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4">
+              <path d="M4 4l12 12M16 4L4 16" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+          </button>
           <textarea
             value={input}
             onChange={(e) => setInput(e.currentTarget.value)}
