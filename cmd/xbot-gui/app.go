@@ -221,7 +221,9 @@ func (a *App) Login(countryCode, phoneNumber, code string) error {
 }
 
 // RefreshToken silently refreshes the JWT. Returns the new auth status.
-// If refresh fails, the session is cleared (frontend should redirect to login).
+// Only clears the session on definitive auth failures (401/403, token revoked).
+// Transient errors (network, 5xx) are treated as retryable — the existing
+// session is preserved and the user stays authenticated.
 func (a *App) RefreshToken() (map[string]interface{}, error) {
 	a.authMu.Lock()
 	defer a.authMu.Unlock()
@@ -238,15 +240,19 @@ func (a *App) RefreshToken() (map[string]interface{}, error) {
 
 	data, err := a.a2aRequest("POST", "/auth/refresh", nil, session.Token)
 	if err != nil {
-		_ = a.clearDesktopSession()
-		return map[string]interface{}{"authenticated": false}, nil
+		if isAuthError(err) {
+			_ = a.clearDesktopSession()
+			return map[string]interface{}{"authenticated": false}, nil
+		}
+		// Transient error: keep session, stay authenticated
+		return map[string]interface{}{"authenticated": true}, nil
 	}
 	var res struct {
 		Token string `json:"token"`
 	}
 	if err := json.Unmarshal(data, &res); err != nil || res.Token == "" {
-		_ = a.clearDesktopSession()
-		return map[string]interface{}{"authenticated": false}, nil
+		// Malformed response — treat as transient, keep session
+		return map[string]interface{}{"authenticated": true}, nil
 	}
 	session.Token = res.Token
 	_ = a.writeDesktopSession(*session)
@@ -720,6 +726,26 @@ type a2aResponse struct {
 	Data    json.RawMessage `json:"d,omitempty"`
 }
 
+// a2aError is returned by a2aRequest for API-level failures (non-zero code or HTTP 4xx/5xx).
+type a2aError struct {
+	HTTPStatus int
+	APICode    int
+	Message    string
+}
+
+func (e *a2aError) Error() string { return e.Message }
+
+// isAuthError returns true if the error indicates an invalid/expired token
+// (as opposed to a transient network or server error).
+func isAuthError(err error) bool {
+	var ae *a2aError
+	if errors.As(err, &ae) {
+		return ae.HTTPStatus == 401 || ae.HTTPStatus == 403 ||
+			(ae.APICode >= 40000 && ae.APICode < 41000)
+	}
+	return false
+}
+
 // a2aRequest calls the A2A REST API. If token is empty, no Authorization header is sent.
 // Returns the unmarshalled `d` field, or an error if the server returned a non-zero `c`.
 func (a *App) a2aRequest(method, path string, body interface{}, token string) (json.RawMessage, error) {
@@ -760,7 +786,7 @@ func (a *App) a2aRequest(method, path string, body interface{}, token string) (j
 	var envelope a2aResponse
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		if resp.StatusCode >= 400 {
-			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(data))
+			return nil, &a2aError{HTTPStatus: resp.StatusCode, Message: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(data))}
 		}
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
@@ -769,7 +795,7 @@ func (a *App) a2aRequest(method, path string, body interface{}, token string) (j
 		if msg == "" {
 			msg = fmt.Sprintf("error code %d", envelope.Code)
 		}
-		return nil, errors.New(msg)
+		return nil, &a2aError{HTTPStatus: resp.StatusCode, APICode: envelope.Code, Message: msg}
 	}
 	return envelope.Data, nil
 }
